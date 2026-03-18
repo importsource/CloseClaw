@@ -1,0 +1,14 @@
+[package]
+name = "closeclaw-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+closeclaw-core = { path = "../closeclaw-core" }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

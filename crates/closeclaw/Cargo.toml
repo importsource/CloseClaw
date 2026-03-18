@@ -1,0 +1,21 @@
+[package]
+name = "closeclaw"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "closeclaw"
+path = "src/main.rs"
+
+[dependencies]
+closeclaw-core = { path = "../closeclaw-core" }
+closeclaw-tools = { path = "../closeclaw-tools" }
+closeclaw-agent = { path = "../closeclaw-agent" }
+closeclaw-channels = { path = "../closeclaw-channels" }
+closeclaw-gateway = { path = "../closeclaw-gateway" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

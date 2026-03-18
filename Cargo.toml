@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/closeclaw-core",
+    "crates/closeclaw-tools",
+    "crates/closeclaw-agent",
+    "crates/closeclaw-channels",
+    "crates/closeclaw-gateway",
+    "crates/closeclaw",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+dashmap = "6"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+html2text = "0.14"
+teloxide = { version = "0.13", features = ["macros"] }
