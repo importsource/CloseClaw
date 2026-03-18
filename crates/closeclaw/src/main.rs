@@ -496,18 +496,7 @@ impl ScheduleNotifier for TelegramNotifier {
             }
         };
 
-        use teloxide::requests::Requester;
-        for chunk in closeclaw_channels::telegram::split_message(response) {
-            if let Err(e) = self.bot.send_message(chat_id, chunk).await {
-                error!(
-                    schedule_id = %schedule_id,
-                    chat_id = %chat_id,
-                    error = %e,
-                    "Failed to send scheduled message to Telegram"
-                );
-                break;
-            }
-        }
+        closeclaw_channels::telegram::send_html(&self.bot, chat_id, response).await;
 
         info!(
             schedule_id = %schedule_id,
