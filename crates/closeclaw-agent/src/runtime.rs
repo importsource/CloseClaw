@@ -38,6 +38,15 @@ impl AgentRuntime {
 
     fn build_context(&self, session: &Session) -> Vec<ChatMessage> {
         let mut ctx = ContextBuilder::new();
+
+        // Inject current date/time so the LLM always knows "today"
+        let now = chrono::Local::now();
+        ctx.add_section(format!(
+            "# Current Date and Time\n\nToday is {}. The current time is {}.",
+            now.format("%A, %B %-d, %Y"),
+            now.format("%-I:%M %p %Z"),
+        ));
+
         ctx.load_file(&self.workspace, "SOUL.md")
             .load_file(&self.workspace, "AGENTS.md")
             .load_file(&self.workspace, "TOOLS.md")
