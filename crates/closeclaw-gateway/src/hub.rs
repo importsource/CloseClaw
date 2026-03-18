@@ -4,6 +4,7 @@ use crate::session_store::SessionStore;
 use closeclaw_agent::runtime::AgentRuntime;
 use closeclaw_core::agent::Agent;
 use closeclaw_core::error::{CloseClawError, Result};
+use closeclaw_core::schedule::CURRENT_PEER_ID;
 use closeclaw_core::session::Session;
 use closeclaw_core::types::{AgentId, Event, Message, MessageContent, SessionId};
 use dashmap::DashMap;
@@ -95,8 +96,8 @@ impl Hub {
             }
         });
 
-        let response = agent
-            .handle_message(&mut session, &user_text, &event_tx)
+        let response = CURRENT_PEER_ID
+            .scope(peer_id, agent.handle_message(&mut session, &user_text, &event_tx))
             .await?;
 
         // Broadcast agent response
@@ -106,6 +107,42 @@ impl Hub {
         });
 
         Ok(response)
+    }
+
+    /// Restore (or create) a session with a deterministic ID. Pre-seeds the
+    /// router so future messages from this channel+peer reuse the same session,
+    /// and loads any persisted history from disk.
+    pub async fn restore_session(
+        &self,
+        channel_id: closeclaw_core::types::ChannelId,
+        peer_id: String,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> Result<()> {
+        // Seed the route so handle_message will find it
+        self.router.seed(
+            channel_id.clone(),
+            peer_id,
+            agent_id.clone(),
+            session_id.clone(),
+        );
+
+        // Load history from disk (empty vec if no file exists)
+        let history = self.session_store.load_history(&session_id).await?;
+        let has_history = !history.is_empty();
+
+        let mut session = Session::new(session_id.clone(), agent_id, channel_id);
+        for msg in history {
+            session.append(msg);
+        }
+
+        self.sessions.insert(session_id.clone(), session);
+
+        if has_history {
+            info!(session = %session_id, "Restored session with history");
+        }
+
+        Ok(())
     }
 
     /// Initialize session store.

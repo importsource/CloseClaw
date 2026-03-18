@@ -1,0 +1,24 @@
+[gateway]
+bind = "127.0.0.1"
+port = 3000
+
+[[agents]]
+id = "default"
+name = "CloseClaw Agent"
+tools = ["exec", "read_file", "write_file", "web_fetch", "web_search", "list_files", "create_file", "delete_file", "search_files"]
+
+[[channels]]
+type = "webchat"
+enabled = true
+
+[[channels]]
+type = "telegram"
+enabled = true
+token_env = "TELOXIDE_TOKEN"
+
+[llm]
+provider = "openai"
+model = "gpt-4-turbo"
+auth_mode = "api_key"
+api_key_env = "OPENAI_API_KEY"
+max_iterations = 25

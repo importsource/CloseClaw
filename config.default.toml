@@ -7,9 +7,15 @@ port = 3000
 [[agents]]
 id = "default"
 name = "CloseClaw Agent"
-tools = ["exec", "read_file", "write_file", "web_fetch", "web_search"]
+tools = ["exec", "read_file", "write_file", "web_fetch", "web_search", "list_files", "create_file", "delete_file", "search_files", "add_schedule", "remove_schedule", "list_schedules"]
 # soul_md = "SOUL.md"
-# skills_dir = "skills"
+
+# Custom skills directory for this agent (in addition to the defaults).
+# Skills are always loaded from:
+#   1. ~/.closeclaw/skills/   (global, persists across all projects)
+#   2. {workspace}/skills/    (project-specific)
+# Set skills_dir to add an extra directory on top of those:
+# skills_dir = "/path/to/my/custom/skills"
 
 [[channels]]
 type = "cli"
@@ -23,6 +29,37 @@ enabled = true
 # type = "telegram"
 # enabled = true
 # token_env = "TELOXIDE_TOKEN"  # env var containing bot token from @BotFather
+
+# Scheduled tasks — cron-style automatic agent execution.
+# Cron format: sec min hour dom month dow year (7 fields)
+#   Field      Allowed values
+#   ─────      ──────────────
+#   sec        0-59
+#   min        0-59
+#   hour       0-23
+#   dom        1-31
+#   month      1-12 (or Jan-Dec)
+#   dow        0-6  (or Sun-Sat, 0 = Sunday)
+#   year       1970-2099 (or *)
+#
+# Examples:
+#   "0 0 9 * * 1-5 *"    → weekdays at 9:00 AM
+#   "0 30 14 * * * *"    → every day at 2:30 PM
+#   "*/10 * * * * * *"   → every 10 seconds (for testing)
+#
+# Each schedule gets a persistent session (sched-{id}) so it retains history.
+
+# [[schedules]]
+# id = "morning-news"
+# cron = "0 0 9 * * 1-5 *"
+# agent_id = "default"
+# message = "Give me a brief news summary for today."
+# enabled = true
+
+# [[schedules]]
+# id = "daily-reminder"
+# cron = "0 30 14 * * * *"
+# message = "Remind me to take a break and stretch."
 
 [llm]
 provider = "anthropic"

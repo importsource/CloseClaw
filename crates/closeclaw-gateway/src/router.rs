@@ -47,6 +47,22 @@ impl Router {
         (agent_id, session_id, true)
     }
 
+    /// Pre-register a route with a known session ID (e.g., for scheduler sessions
+    /// that need deterministic IDs across restarts).
+    pub fn seed(
+        &self,
+        channel_id: ChannelId,
+        peer_id: String,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) {
+        let key = RouteKey {
+            channel_id,
+            peer_id,
+        };
+        self.routes.insert(key, (agent_id, session_id));
+    }
+
     /// Remove a route (e.g., on session reset).
     pub fn remove(&self, channel_id: &ChannelId, peer_id: &str) {
         let key = RouteKey {

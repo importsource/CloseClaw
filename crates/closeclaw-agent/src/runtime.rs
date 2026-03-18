@@ -15,6 +15,7 @@ pub struct AgentRuntime {
     pub llm: Arc<dyn LlmProvider>,
     pub tools: Arc<ToolRegistry>,
     pub workspace: PathBuf,
+    pub skills_dirs: Vec<PathBuf>,
     pub max_iterations: usize,
 }
 
@@ -23,12 +24,14 @@ impl AgentRuntime {
         llm: Arc<dyn LlmProvider>,
         tools: Arc<ToolRegistry>,
         workspace: PathBuf,
+        skills_dirs: Vec<PathBuf>,
         max_iterations: usize,
     ) -> Self {
         Self {
             llm,
             tools,
             workspace,
+            skills_dirs,
             max_iterations,
         }
     }
@@ -39,8 +42,11 @@ impl AgentRuntime {
             .load_file(&self.workspace, "AGENTS.md")
             .load_file(&self.workspace, "TOOLS.md")
             .load_file(&self.workspace, "IDENTITY.md")
-            .load_file(&self.workspace, "USER.md")
-            .load_skills(&self.workspace.join("skills"));
+            .load_file(&self.workspace, "USER.md");
+
+        for dir in &self.skills_dirs {
+            ctx.load_skills(dir);
+        }
 
         ctx.build_messages(&session.history)
     }

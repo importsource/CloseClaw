@@ -13,20 +13,13 @@ impl ReadFileTool {
         Self { workspace }
     }
 
-    fn resolve_path(&self, path: &str) -> std::result::Result<PathBuf, String> {
-        let full = if std::path::Path::new(path).is_absolute() {
-            PathBuf::from(path)
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
         } else {
             self.workspace.join(path)
-        };
-        // Prevent path traversal outside workspace
-        let canonical = full
-            .canonicalize()
-            .map_err(|e| format!("Cannot resolve path: {e}"))?;
-        if !canonical.starts_with(&self.workspace) {
-            return Err("Path is outside workspace".to_string());
         }
-        Ok(canonical)
     }
 }
 
@@ -35,13 +28,13 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read the contents of a file from the workspace.".to_string(),
+            description: "Read the contents of a file. Accepts absolute paths or paths relative to the workspace.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path (relative to workspace or absolute)"
+                        "description": "Absolute file path, or relative to workspace"
                     },
                     "max_lines": {
                         "type": "integer",
@@ -58,10 +51,7 @@ impl Tool for ReadFileTool {
             .as_str()
             .ok_or_else(|| closeclaw_core::error::CloseClawError::Tool("missing 'path' field".into()))?;
 
-        let resolved = match self.resolve_path(path) {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(e)),
-        };
+        let resolved = self.resolve_path(path);
 
         let content = match tokio::fs::read_to_string(&resolved).await {
             Ok(c) => c,

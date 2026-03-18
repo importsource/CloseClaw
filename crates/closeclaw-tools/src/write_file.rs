@@ -13,23 +13,13 @@ impl WriteFileTool {
         Self { workspace }
     }
 
-    fn resolve_path(&self, path: &str) -> std::result::Result<PathBuf, String> {
-        let full = if std::path::Path::new(path).is_absolute() {
-            PathBuf::from(path)
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            p.to_path_buf()
         } else {
             self.workspace.join(path)
-        };
-        // For new files, check the parent directory is within workspace
-        let parent = full
-            .parent()
-            .ok_or_else(|| "Invalid path".to_string())?;
-        // Parent must exist or be creatable within workspace
-        if let Ok(canonical_parent) = parent.canonicalize() {
-            if !canonical_parent.starts_with(&self.workspace) {
-                return Err("Path is outside workspace".to_string());
-            }
         }
-        Ok(full)
     }
 }
 
@@ -38,13 +28,13 @@ impl Tool for WriteFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".to_string(),
-            description: "Write content to a file in the workspace. Creates parent directories if needed.".to_string(),
+            description: "Write content to a file. Creates parent directories if needed. Accepts absolute paths or paths relative to the workspace.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path (relative to workspace or absolute)"
+                        "description": "Absolute file path, or relative to workspace"
                     },
                     "content": {
                         "type": "string",
@@ -64,10 +54,7 @@ impl Tool for WriteFileTool {
             .as_str()
             .ok_or_else(|| closeclaw_core::error::CloseClawError::Tool("missing 'content' field".into()))?;
 
-        let resolved = match self.resolve_path(path) {
-            Ok(p) => p,
-            Err(e) => return Ok(ToolResult::error(e)),
-        };
+        let resolved = self.resolve_path(path);
 
         // Create parent directories
         if let Some(parent) = resolved.parent() {

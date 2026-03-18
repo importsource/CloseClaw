@@ -14,8 +14,11 @@ closeclaw-agent = { path = "../closeclaw-agent" }
 closeclaw-channels = { path = "../closeclaw-channels" }
 closeclaw-gateway = { path = "../closeclaw-gateway" }
 anyhow = { workspace = true }
+axum = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+teloxide = { workspace = true }
+async-trait = { workspace = true }

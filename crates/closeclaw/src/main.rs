@@ -1,3 +1,5 @@
+mod setup;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use closeclaw_agent::llm::{AnthropicAuth, AnthropicProvider, OpenAiProvider};
@@ -6,9 +8,12 @@ use closeclaw_agent::tool_dispatch::ToolRegistry;
 use closeclaw_channels::cli::CliChannel;
 use closeclaw_channels::telegram::TelegramChannel;
 use closeclaw_core::config::{AuthMode, ChannelType, Config, LlmProvider};
+use closeclaw_core::schedule::ScheduleNotifier;
 use closeclaw_core::types::AgentId;
 use closeclaw_gateway::hub::Hub;
-use std::path::PathBuf;
+use closeclaw_gateway::schedule_store::ScheduleStore;
+use closeclaw_gateway::scheduler::{ScheduleHandleImpl, Scheduler};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -46,22 +51,89 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    load_dotenv();
+
     let cli = Cli::parse();
 
-    let config = load_config(&cli.config)?;
-    let workspace = cli
+    match cli.command {
+        Some(Command::Run) | Some(Command::Chat) | Some(Command::Telegram) => {
+            let config = load_config(&cli.config)?;
+            let workspace = cli
+                .workspace
+                .unwrap_or_else(|| config.workspace.clone())
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from("."));
+            info!("Workspace: {}", workspace.display());
+
+            match cli.command.unwrap() {
+                Command::Chat => run_chat(config, workspace).await,
+                Command::Run => run_gateway(config, workspace).await,
+                Command::Telegram => run_telegram(config, workspace).await,
+            }
+        }
+        None => {
+            if needs_setup(&cli.config) {
+                run_setup(cli.config).await
+            } else {
+                let config = load_config(&cli.config)?;
+                let workspace = cli
+                    .workspace
+                    .unwrap_or_else(|| config.workspace.clone())
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from("."));
+                info!("Workspace: {}", workspace.display());
+                run_chat(config, workspace).await
+            }
+        }
+    }
+}
+
+/// Load `~/.closeclaw/.env` into process env vars (only if not already set).
+fn load_dotenv() {
+    let path = dirs_home().join(".closeclaw/.env");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let value = value.trim();
+            if std::env::var(key).is_err() {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+}
+
+/// Returns true if the setup wizard should be shown.
+fn needs_setup(config_path: &Path) -> bool {
+    if !config_path.exists() {
+        return true;
+    }
+    // Config exists — still need setup if no API key is available
+    std::env::var("ANTHROPIC_API_KEY").is_err() && std::env::var("OPENAI_API_KEY").is_err()
+}
+
+/// Run the setup wizard, then start the gateway.
+async fn run_setup(config_path: PathBuf) -> Result<()> {
+    setup::serve_setup("127.0.0.1", 3000, config_path.clone()).await?;
+
+    // Re-load the freshly-written config
+    let config = Config::from_file(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load config after setup: {e}"))?;
+    let workspace = config
         .workspace
-        .unwrap_or_else(|| config.workspace.clone())
+        .clone()
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from("."));
-
     info!("Workspace: {}", workspace.display());
 
-    match cli.command.unwrap_or(Command::Chat) {
-        Command::Chat => run_chat(config, workspace).await,
-        Command::Run => run_gateway(config, workspace).await,
-        Command::Telegram => run_telegram(config, workspace).await,
-    }
+    run_gateway(config, workspace).await
 }
 
 fn load_config(path: &PathBuf) -> Result<Config> {
@@ -87,6 +159,13 @@ fn default_config() -> Config {
                 "write_file".to_string(),
                 "web_fetch".to_string(),
                 "web_search".to_string(),
+                "list_files".to_string(),
+                "create_file".to_string(),
+                "delete_file".to_string(),
+                "search_files".to_string(),
+                "add_schedule".to_string(),
+                "remove_schedule".to_string(),
+                "list_schedules".to_string(),
             ],
             skills_dir: None,
         }],
@@ -101,6 +180,7 @@ fn default_config() -> Config {
             max_iterations: 25,
         },
         workspace: PathBuf::from("."),
+        schedules: vec![],
     }
 }
 
@@ -196,22 +276,55 @@ fn read_claude_code_keychain_token() -> Option<String> {
     }
 }
 
-fn build_tool_registry(workspace: &PathBuf) -> ToolRegistry {
+/// Collect skill directories in priority order:
+/// 1. `~/.closeclaw/skills/` — global user skills
+/// 2. `{workspace}/skills/` — project-specific skills
+/// 3. `agent_config.skills_dir` — custom per-agent override (if set)
+fn collect_skills_dirs(workspace: &Path, config: &Config) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // Global user skills
+    dirs.push(dirs_home().join(".closeclaw/skills"));
+
+    // Project-specific skills
+    dirs.push(workspace.join("skills"));
+
+    // Per-agent custom skills_dir (use first agent's config)
+    if let Some(agent) = config.agents.first() {
+        if let Some(ref custom) = agent.skills_dir {
+            dirs.push(custom.clone());
+        }
+    }
+
+    dirs
+}
+
+fn build_tool_registry(
+    workspace: &PathBuf,
+    schedule_handle: Option<Arc<dyn closeclaw_core::schedule::ScheduleHandle>>,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     for tool in closeclaw_tools::builtin_tools(workspace) {
         registry.register(tool);
+    }
+    if let Some(handle) = schedule_handle {
+        for tool in closeclaw_tools::schedule_tools(handle) {
+            registry.register(tool);
+        }
     }
     registry
 }
 
 async fn run_chat(config: Config, workspace: PathBuf) -> Result<()> {
     let llm = build_llm_provider(&config)?;
-    let tools = Arc::new(build_tool_registry(&workspace));
+    let tools = Arc::new(build_tool_registry(&workspace, None));
+    let skills_dirs = collect_skills_dirs(&workspace, &config);
 
     let agent_runtime = Arc::new(AgentRuntime::new(
         llm,
         tools,
         workspace.clone(),
+        skills_dirs,
         config.llm.max_iterations,
     ));
 
@@ -230,12 +343,21 @@ async fn run_chat(config: Config, workspace: PathBuf) -> Result<()> {
 
 async fn run_gateway(config: Config, workspace: PathBuf) -> Result<()> {
     let llm = build_llm_provider(&config)?;
-    let tools = Arc::new(build_tool_registry(&workspace));
+
+    // 1. Create mpsc channel for schedule commands
+    let (sched_tx, sched_rx) = tokio::sync::mpsc::channel(64);
+    let schedule_handle: Arc<dyn closeclaw_core::schedule::ScheduleHandle> =
+        Arc::new(ScheduleHandleImpl::new(sched_tx));
+
+    // 2. Build tool registry with schedule tools
+    let tools = Arc::new(build_tool_registry(&workspace, Some(schedule_handle)));
+    let skills_dirs = collect_skills_dirs(&workspace, &config);
 
     let agent_runtime = Arc::new(AgentRuntime::new(
         llm,
         tools,
         workspace.clone(),
+        skills_dirs,
         config.llm.max_iterations,
     ));
 
@@ -271,6 +393,31 @@ async fn run_gateway(config: Config, workspace: PathBuf) -> Result<()> {
         }
     }
 
+    // Build notifier for schedule response delivery
+    let notifier: Option<Arc<dyn ScheduleNotifier>> = {
+        // If Telegram is enabled, create a notifier that delivers to Telegram chats
+        let tg_token = config
+            .channels
+            .iter()
+            .find(|c| c.channel_type == ChannelType::Telegram && c.enabled.unwrap_or(true))
+            .and_then(|c| resolve_telegram_token(c.token_env.as_deref()).ok());
+        tg_token.map(|token| {
+            Arc::new(TelegramNotifier {
+                bot: teloxide::Bot::new(token),
+            }) as Arc<dyn ScheduleNotifier>
+        })
+    };
+
+    // Always start scheduler (dynamic schedules may arrive via tools)
+    let store = ScheduleStore::new(dirs_home().join(".closeclaw/schedules.json"));
+    let scheduler = Scheduler::new(&config.schedules, store, sched_rx, notifier);
+    scheduler.restore_sessions(&hub).await;
+    let hub_sched = hub.clone();
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    handles.push(tokio::spawn(async move {
+        scheduler.run(hub_sched, shutdown_rx).await;
+    }));
+
     // Wait for any channel to finish (typically they run forever)
     for handle in handles {
         handle.await.ok();
@@ -281,12 +428,14 @@ async fn run_gateway(config: Config, workspace: PathBuf) -> Result<()> {
 
 async fn run_telegram(config: Config, workspace: PathBuf) -> Result<()> {
     let llm = build_llm_provider(&config)?;
-    let tools = Arc::new(build_tool_registry(&workspace));
+    let tools = Arc::new(build_tool_registry(&workspace, None));
+    let skills_dirs = collect_skills_dirs(&workspace, &config);
 
     let agent_runtime = Arc::new(AgentRuntime::new(
         llm,
         tools,
         workspace.clone(),
+        skills_dirs,
         config.llm.max_iterations,
     ));
 
@@ -323,4 +472,47 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Delivers scheduled task responses to Telegram chats.
+/// Parses the peer_id (format "tg:{chat_id}") to extract the Telegram chat ID.
+struct TelegramNotifier {
+    bot: teloxide::Bot,
+}
+
+#[async_trait::async_trait]
+impl ScheduleNotifier for TelegramNotifier {
+    async fn notify(&self, schedule_id: &str, peer_id: &str, response: &str) {
+        // peer_id format from Telegram channel: "tg:{chat_id}"
+        let chat_id = match peer_id.strip_prefix("tg:").and_then(|s| s.parse::<i64>().ok()) {
+            Some(id) => teloxide::types::ChatId(id),
+            None => {
+                tracing::warn!(
+                    schedule_id = %schedule_id,
+                    peer_id = %peer_id,
+                    "Cannot deliver schedule notification: peer_id is not a Telegram chat"
+                );
+                return;
+            }
+        };
+
+        use teloxide::requests::Requester;
+        for chunk in closeclaw_channels::telegram::split_message(response) {
+            if let Err(e) = self.bot.send_message(chat_id, chunk).await {
+                error!(
+                    schedule_id = %schedule_id,
+                    chat_id = %chat_id,
+                    error = %e,
+                    "Failed to send scheduled message to Telegram"
+                );
+                break;
+            }
+        }
+
+        info!(
+            schedule_id = %schedule_id,
+            chat_id = %chat_id,
+            "Delivered scheduled response to Telegram"
+        );
+    }
 }

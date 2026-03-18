@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -10,6 +10,8 @@ pub struct Config {
     pub llm: LlmConfig,
     #[serde(default = "default_workspace")]
     pub workspace: PathBuf,
+    #[serde(default)]
+    pub schedules: Vec<ScheduleConfig>,
 }
 
 fn default_workspace() -> PathBuf {
@@ -70,6 +72,26 @@ pub enum ChannelType {
     Cli,
     Webchat,
     Telegram,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    pub id: String,
+    /// 7-field cron expression: sec min hour dom month dow year
+    pub cron: String,
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+    pub message: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_agent_id() -> String {
+    "default".to_string()
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -261,5 +283,53 @@ id = "a1"
 "#;
         let config = Config::from_toml(toml).unwrap();
         assert_eq!(config.llm.auth_mode, AuthMode::ApiKey);
+    }
+
+    #[test]
+    fn test_parse_schedules() {
+        let toml = r#"
+[gateway]
+
+[[agents]]
+id = "default"
+
+[[schedules]]
+id = "morning-news"
+cron = "0 0 9 * * 1-5 *"
+agent_id = "default"
+message = "Give me a news briefing"
+enabled = true
+
+[[schedules]]
+id = "reminder"
+cron = "0 30 14 * * * *"
+message = "Remind me to stretch"
+
+[llm]
+"#;
+        let config = Config::from_toml(toml).unwrap();
+        assert_eq!(config.schedules.len(), 2);
+        assert_eq!(config.schedules[0].id, "morning-news");
+        assert_eq!(config.schedules[0].cron, "0 0 9 * * 1-5 *");
+        assert_eq!(config.schedules[0].agent_id, "default");
+        assert!(config.schedules[0].enabled);
+        // Second schedule uses defaults for agent_id and enabled
+        assert_eq!(config.schedules[1].id, "reminder");
+        assert_eq!(config.schedules[1].agent_id, "default");
+        assert!(config.schedules[1].enabled);
+    }
+
+    #[test]
+    fn test_no_schedules_defaults_to_empty() {
+        let toml = r#"
+[gateway]
+
+[[agents]]
+id = "a1"
+
+[llm]
+"#;
+        let config = Config::from_toml(toml).unwrap();
+        assert!(config.schedules.is_empty());
     }
 }
