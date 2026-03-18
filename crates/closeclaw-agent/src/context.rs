@@ -41,7 +41,7 @@ impl ContextBuilder {
         if !skills.is_empty() {
             let mut section = String::from("# Available Skills\n\n");
             for skill in &skills {
-                section.push_str(&format!("## {}\n{}\n\n", skill.name, skill.description));
+                section.push_str(&format!("## {}\n{}\n\n{}\n\n", skill.name, skill.description, skill.content));
             }
             self.parts.push(section);
         }
