@@ -1,6 +1,17 @@
-# File Organizer
-Organize files in the workspace by type, date, or custom rules.
+---
+name: File Organizer
+description: Organize files in the workspace by type, date, or custom rules.
+user-invocable: true
+metadata:
+  emoji: "\U0001F4C1"
+---
 
+# File Organizer
+
+## What it does
+Scans a directory and organizes files into a structured folder layout based on type, date, or custom rules.
+
+## Workflow
 When the user asks you to organize files:
 
 1. Use `list_files` to scan the target directory.
@@ -13,3 +24,7 @@ When the user asks you to organize files:
 4. Ask the user for confirmation before moving any files.
 5. Use `exec` to move files into the agreed structure.
 6. Report what was moved and the final directory layout.
+
+## Guardrails
+- Never move files without explicit user confirmation.
+- Skip hidden files and directories (those starting with `.`) unless told otherwise.

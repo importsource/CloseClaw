@@ -29,3 +29,5 @@ html2text = "0.14"
 teloxide = { version = "0.13", features = ["macros"] }
 cron = "0.15"
 regex = "1"
+serde_yml = "0.0.12"
+which = "7"

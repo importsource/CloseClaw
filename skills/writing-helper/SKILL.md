@@ -1,6 +1,17 @@
-# Writing Helper
-Help the user draft, edit, and improve written content.
+---
+name: Writing Helper
+description: Help the user draft, edit, and improve written content.
+user-invocable: true
+metadata:
+  emoji: "\U0000270D"
+---
 
+# Writing Helper
+
+## What it does
+Assists with drafting new content, editing existing text, and improving written pieces across all formats.
+
+## Workflow
 When the user asks for writing help:
 
 1. Clarify the type of content (email, blog post, report, social media, essay, etc.) and the target audience.
@@ -17,3 +28,7 @@ When the user asks for writing help:
    - Tighten wordy passages
    - Strengthen the opening and closing
 5. If asked, save the result using `write_file`.
+
+## Guardrails
+- Respect the user's voice and style — enhance, don't replace.
+- Always ask before making major structural changes.
