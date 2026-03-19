@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod exec;
 pub mod read_file;
 pub mod sandbox;
@@ -23,6 +24,7 @@ pub fn builtin_tools(workspace: &Path) -> Vec<Arc<dyn Tool>> {
         Arc::new(sandbox::CreateFileTool::new(workspace.to_path_buf())),
         Arc::new(sandbox::DeleteFileTool::new(workspace.to_path_buf())),
         Arc::new(sandbox::SearchFilesTool::new(workspace.to_path_buf())),
+        Arc::new(browser::BrowserTool::new(workspace.to_path_buf())),
     ]
 }
 

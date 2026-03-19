@@ -3,3 +3,7 @@
 *.swp
 *.swo
 .DS_Store
+.browser-profile/
+screenshots/
+candidate_profile.toml
+Resume-*.pdf

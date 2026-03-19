@@ -95,7 +95,7 @@ port = 3000
 [[agents]]
 id = "default"
 name = "CloseClaw Agent"
-tools = ["exec", "read_file", "write_file", "web_fetch", "web_search", "list_files", "create_file", "delete_file", "search_files"]
+tools = ["exec", "read_file", "write_file", "web_fetch", "web_search", "list_files", "create_file", "delete_file", "search_files", "browser"]
 
 [[channels]]
 type = "webchat"

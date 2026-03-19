@@ -163,6 +163,7 @@ fn default_config() -> Config {
                 "create_file".to_string(),
                 "delete_file".to_string(),
                 "search_files".to_string(),
+                "browser".to_string(),
                 "add_schedule".to_string(),
                 "remove_schedule".to_string(),
                 "list_schedules".to_string(),
@@ -387,8 +388,9 @@ async fn run_gateway(config: Config, workspace: PathBuf) -> Result<()> {
         if ch.channel_type == ChannelType::Telegram && ch.enabled.unwrap_or(true) {
             let token = resolve_telegram_token(ch.token_env.as_deref())?;
             let hub_tg = hub.clone();
+            let ws = workspace.clone();
             handles.push(tokio::spawn(async move {
-                TelegramChannel::new(token).run(hub_tg).await;
+                TelegramChannel::new(token, ws).run(hub_tg).await;
             }));
         }
     }
@@ -457,7 +459,7 @@ async fn run_telegram(config: Config, workspace: PathBuf) -> Result<()> {
     let token = resolve_telegram_token(token_env)?;
 
     info!("Starting standalone Telegram bot");
-    TelegramChannel::new(token).run(hub).await;
+    TelegramChannel::new(token, workspace).run(hub).await;
 
     Ok(())
 }

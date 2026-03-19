@@ -1,8 +1,12 @@
 use closeclaw_core::types::{ChannelId, Message, MessageContent, Sender};
 use closeclaw_gateway::hub::Hub;
+use regex::Regex;
+use std::path::PathBuf;
 use std::sync::Arc;
+use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{InputFile, ParseMode};
+use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
 /// Maximum message length allowed by the Telegram Bot API.
@@ -11,16 +15,18 @@ const TELEGRAM_MAX_LEN: usize = 4096;
 /// Telegram bot channel — receives messages via long polling, sends responses back.
 pub struct TelegramChannel {
     token: String,
+    workspace: PathBuf,
 }
 
 impl TelegramChannel {
-    pub fn new(token: String) -> Self {
-        Self { token }
+    pub fn new(token: String, workspace: PathBuf) -> Self {
+        Self { token, workspace }
     }
 
     /// Run the Telegram bot with long polling. This blocks until the bot is stopped.
     pub async fn run(self, hub: Arc<Hub>) {
         let bot = Bot::new(&self.token);
+        let downloads_dir = self.workspace.join("downloads");
 
         info!("Telegram channel starting (long polling)");
 
@@ -29,10 +35,34 @@ impl TelegramChannel {
         teloxide::repl(bot, move |bot: Bot, telegram_msg: teloxide::types::Message| {
             let hub = hub.clone();
             let channel_id = channel_id.clone();
+            let downloads_dir = downloads_dir.clone();
             async move {
-                let text = match telegram_msg.text() {
-                    Some(t) => t.to_string(),
-                    None => return Ok(()), // ignore non-text messages
+                let text = if let Some(t) = telegram_msg.text() {
+                    t.to_string()
+                } else if let Some(photos) = telegram_msg.photo() {
+                    match download_photo(&bot, photos, &downloads_dir).await {
+                        Ok(path) => {
+                            let caption = telegram_msg.caption().unwrap_or("");
+                            format!("[Photo received and saved to {}]\n{}", path.display(), caption)
+                        }
+                        Err(e) => {
+                            error!("Failed to download photo: {e}");
+                            return Ok(());
+                        }
+                    }
+                } else if let Some(doc) = telegram_msg.document() {
+                    match download_document(&bot, doc, &downloads_dir).await {
+                        Ok((path, filename)) => {
+                            let caption = telegram_msg.caption().unwrap_or("");
+                            format!("[File \"{filename}\" received and saved to {}]\n{}", path.display(), caption)
+                        }
+                        Err(e) => {
+                            error!("Failed to download document: {e}");
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    return Ok(()); // ignore stickers, voice, etc.
                 };
 
                 let chat_id = telegram_msg.chat.id;
@@ -68,13 +98,99 @@ impl TelegramChannel {
                     }
                 };
 
-                send_html(&bot, chat_id, &response).await;
+                let (image_paths, remaining_text) = extract_image_paths(&response).await;
+
+                for path in &image_paths {
+                    if let Err(e) = bot
+                        .send_photo(chat_id, InputFile::file(path))
+                        .await
+                    {
+                        error!("Failed to send photo {}: {e}", path.display());
+                    }
+                }
+
+                let text_to_send = remaining_text.trim();
+                if !text_to_send.is_empty() {
+                    send_html(&bot, chat_id, text_to_send).await;
+                }
 
                 Ok(())
             }
         })
         .await;
     }
+}
+
+/// Download the largest photo from a photo array and save it to the downloads directory.
+async fn download_photo(
+    bot: &Bot,
+    photos: &[teloxide::types::PhotoSize],
+    downloads_dir: &PathBuf,
+) -> anyhow::Result<PathBuf> {
+    let photo = photos.last().ok_or_else(|| anyhow::anyhow!("Empty photo array"))?;
+    let file = bot.get_file(&photo.file.id).await?;
+    let file_path = &file.path;
+
+    tokio::fs::create_dir_all(downloads_dir).await?;
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg");
+    let local_name = format!("{}.{}", uuid::Uuid::new_v4(), ext);
+    let dest = downloads_dir.join(&local_name);
+
+    let mut out = tokio::fs::File::create(&dest).await?;
+    bot.download_file(file_path, &mut out).await?;
+    out.flush().await?;
+
+    info!("Downloaded photo to {}", dest.display());
+    Ok(dest)
+}
+
+/// Download a document and save it to the downloads directory, preserving the original filename.
+async fn download_document(
+    bot: &Bot,
+    doc: &teloxide::types::Document,
+    downloads_dir: &PathBuf,
+) -> anyhow::Result<(PathBuf, String)> {
+    let file = bot.get_file(&doc.file.id).await?;
+    let file_path = &file.path;
+
+    tokio::fs::create_dir_all(downloads_dir).await?;
+    let original_name = doc
+        .file_name
+        .clone()
+        .unwrap_or_else(|| format!("{}.bin", uuid::Uuid::new_v4()));
+    // Prepend UUID to avoid collisions while keeping the original name recognizable
+    let local_name = format!("{}_{}", uuid::Uuid::new_v4(), original_name);
+    let dest = downloads_dir.join(&local_name);
+
+    let mut out = tokio::fs::File::create(&dest).await?;
+    bot.download_file(file_path, &mut out).await?;
+    out.flush().await?;
+
+    info!("Downloaded document '{}' to {}", original_name, dest.display());
+    Ok((dest, original_name))
+}
+
+/// Extract local image file paths from the response text.
+///
+/// Scans for absolute paths ending with common image extensions, verifies they
+/// exist on disk, and returns the found paths plus the text with those paths stripped.
+async fn extract_image_paths(text: &str) -> (Vec<PathBuf>, String) {
+    let re = Regex::new(r#"(/[^\s\]\)"']+\.(?:jpg|jpeg|png|gif|webp|bmp))"#).unwrap();
+    let mut paths = Vec::new();
+    let mut cleaned = text.to_string();
+
+    for cap in re.find_iter(text) {
+        let path = PathBuf::from(cap.as_str());
+        if tokio::fs::metadata(&path).await.is_ok() {
+            paths.push(path);
+            cleaned = cleaned.replace(cap.as_str(), "");
+        }
+    }
+
+    (paths, cleaned)
 }
 
 /// Send a markdown response as Telegram HTML, falling back to plain text on parse errors.

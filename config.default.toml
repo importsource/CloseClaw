@@ -7,7 +7,7 @@ port = 3000
 [[agents]]
 id = "default"
 name = "CloseClaw Agent"
-tools = ["exec", "read_file", "write_file", "web_fetch", "web_search", "list_files", "create_file", "delete_file", "search_files", "add_schedule", "remove_schedule", "list_schedules"]
+tools = ["exec", "read_file", "write_file", "web_fetch", "web_search", "list_files", "create_file", "delete_file", "search_files", "browser", "add_schedule", "remove_schedule", "list_schedules"]
 # soul_md = "SOUL.md"
 
 # Custom skills directory for this agent (in addition to the defaults).
