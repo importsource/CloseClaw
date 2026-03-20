@@ -191,13 +191,33 @@ auth_mode = "api_key"
 api_key_env = "ANTHROPIC_API_KEY"
 ```
 
-**OAuth mode** (compatible with Claude Code):
+**OAuth mode** — use your Claude subscription (Pro/Team/Max) instead of an API key:
 
-```toml
-[llm]
-auth_mode = "oauth_token"
-token_env = "CLAUDE_CODE_TOKEN"  # or omit to auto-read from macOS Keychain
+1. Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and log in:
+   ```bash
+   npm install -g @anthropic-ai/claude-code
+   claude login
+   ```
+2. Set your config:
+   ```toml
+   [llm]
+   provider = "anthropic"
+   model = "claude-sonnet-4-20250514"
+   auth_mode = "oauth_token"
+   ```
+
+On macOS, CloseClaw automatically reads the OAuth token from the Keychain (where `claude login` stores it). On other platforms, set the token manually:
+
+```bash
+export CLAUDE_CODE_TOKEN="sk-ant-oat01-..."
 ```
+
+Available models with Claude subscription:
+
+| Model | Config value |
+|-------|-------------|
+| Sonnet 4 | `claude-sonnet-4-20250514` |
+| Haiku 4.5 | `claude-haiku-4-5-20251001` |
 
 ### OpenAI
 

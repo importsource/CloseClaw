@@ -249,30 +249,44 @@ fn resolve_anthropic_auth(config: &Config) -> Result<AnthropicAuth> {
 
 /// Attempt to read Claude Code's OAuth token from the macOS Keychain.
 /// Returns None on non-macOS platforms or if the keychain entry doesn't exist.
+///
+/// Claude Code stores credentials under the service name "Claude Code-credentials"
+/// as a JSON blob. The OAuth token lives at `.claudeAiOauth.accessToken`.
 fn read_claude_code_keychain_token() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        // Claude Code stores its OAuth token under the service name "claude.ai"
-        // in the user's login keychain. We try common service names.
-        for service in &["claude.ai", "claude-code", "api.anthropic.com"] {
-            let output = std::process::Command::new("security")
-                .args(["find-generic-password", "-s", service, "-w"])
-                .output()
-                .ok()?;
+        let output = std::process::Command::new("security")
+            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+            .output()
+            .ok()?;
 
-            if output.status.success() {
-                let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !token.is_empty() {
-                    return Some(token);
-                }
-            }
+        if !output.status.success() {
+            return None;
         }
-        None
+
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if raw.is_empty() {
+            return None;
+        }
+
+        // Parse JSON and extract the OAuth access token
+        let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let token = json
+            .get("claudeAiOauth")?
+            .get("accessToken")?
+            .as_str()?
+            .to_string();
+
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        warn!("Keychain token extraction is only supported on macOS");
+        tracing::warn!("Keychain token extraction is only supported on macOS");
         None
     }
 }

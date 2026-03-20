@@ -17,8 +17,7 @@ enabled = true
 token_env = "TELOXIDE_TOKEN"
 
 [llm]
-provider = "openai"
-model = "gpt-4-turbo"
-auth_mode = "api_key"
-api_key_env = "OPENAI_API_KEY"
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+auth_mode = "oauth_token"
 max_iterations = 100

@@ -72,8 +72,10 @@ auth_mode = "api_key"
 # For api_key mode: env var containing the API key
 api_key_env = "ANTHROPIC_API_KEY"
 
-# For oauth_token mode: env var containing the OAuth token.
-# Falls back to reading Claude Code's keychain entry on macOS.
+# For oauth_token mode: use your Claude subscription (Pro/Team/Max) instead of an API key.
+# Requires `claude login` first (npm install -g @anthropic-ai/claude-code).
+# On macOS the token is read from the Keychain automatically.
+# On other platforms, set the env var below:
 # token_env = "CLAUDE_CODE_TOKEN"
 
 # workspace = "."

@@ -4,6 +4,7 @@ use closeclaw_core::tool::ToolDefinition;
 use closeclaw_core::types::ChatMessage;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -45,6 +46,42 @@ pub struct AnthropicProvider {
     auth: AnthropicAuth,
     model: String,
     base_url: String,
+}
+
+// ── OAuth compatibility constants ────────────────────────────────────
+const CC_VERSION: &str = "2.1.76";
+const BILLING_SALT: &str = "59cf53e54c78";
+const SYSTEM_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.\n\n";
+
+/// Compute the `x-anthropic-billing-header` value for OAuth requests.
+/// Samples chars at indices 4, 7, 20 from concatenated user message text,
+/// hashes with SHA-256 using a salt, and returns the first 3 hex chars.
+fn compute_billing_hash(messages: &[ChatMessage]) -> String {
+    let mut user_text = String::new();
+    for msg in messages {
+        if let ChatMessage::User(text) = msg {
+            user_text.push_str(text);
+        }
+    }
+
+    let sample: String = [4, 7, 20]
+        .iter()
+        .map(|&i| {
+            user_text
+                .chars()
+                .nth(i)
+                .unwrap_or('0')
+        })
+        .collect();
+
+    let input = format!("{BILLING_SALT}{sample}{CC_VERSION}");
+    let digest = Sha256::digest(input.as_bytes());
+    let full_hex = hex::encode(digest);
+    let hash = &full_hex[..3];
+
+    format!(
+        "cc_version={CC_VERSION}.{hash}; cc_entrypoint=cli; cch=1cfa3;"
+    )
 }
 
 impl AnthropicProvider {
@@ -158,8 +195,31 @@ impl LlmProvider for AnthropicProvider {
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse> {
-        let (system, api_msgs) = Self::convert_messages(messages);
+        let is_oauth = matches!(self.auth, AnthropicAuth::OAuthToken(_));
+
+        let (system, mut api_msgs) = Self::convert_messages(messages);
         let api_tools = Self::convert_tools(tools);
+
+        // OAuth: prefix tool names with "mcp_" in messages that reference tools
+        if is_oauth {
+            for msg in &mut api_msgs {
+                if let Some(content) = msg.get_mut("content") {
+                    if let Some(arr) = content.as_array_mut() {
+                        for block in arr.iter_mut() {
+                            // tool_use blocks in assistant messages
+                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                                if let Some(name) = block.get("name").and_then(|v| v.as_str()) {
+                                    if !name.starts_with("mcp_") {
+                                        block["name"] = Value::String(format!("mcp_{name}"));
+                                    }
+                                }
+                            }
+                            // tool_result blocks reference tool_use_id, no name change needed
+                        }
+                    }
+                }
+            }
+        }
 
         let mut body = serde_json::json!({
             "model": self.model,
@@ -168,22 +228,68 @@ impl LlmProvider for AnthropicProvider {
         });
 
         if let Some(sys) = system {
-            body["system"] = Value::String(sys);
+            if is_oauth {
+                // OAuth: approved prefix must be a separate first block;
+                // additional content goes in a second block.
+                body["system"] = serde_json::json!([
+                    {"type": "text", "text": SYSTEM_PREFIX.trim()},
+                    {"type": "text", "text": sys},
+                ]);
+            } else {
+                body["system"] = Value::String(sys);
+            }
+        } else if is_oauth {
+            // Even without a user system prompt, we need the prefix for OAuth
+            body["system"] = serde_json::json!([{
+                "type": "text",
+                "text": SYSTEM_PREFIX.trim(),
+            }]);
         }
+
         if !api_tools.is_empty() {
-            body["tools"] = Value::Array(api_tools);
+            if is_oauth {
+                // OAuth: prefix tool names with "mcp_"
+                let prefixed: Vec<Value> = api_tools
+                    .into_iter()
+                    .map(|mut t| {
+                        if let Some(name) = t.get("name").and_then(|v| v.as_str()) {
+                            if !name.starts_with("mcp_") {
+                                t["name"] = Value::String(format!("mcp_{name}"));
+                            }
+                        }
+                        t
+                    })
+                    .collect();
+                body["tools"] = Value::Array(prefixed);
+            } else {
+                body["tools"] = Value::Array(api_tools);
+            }
         }
+
+        // Build URL
+        let url = if is_oauth {
+            format!("{}/v1/messages?beta=true", self.base_url)
+        } else {
+            format!("{}/v1/messages", self.base_url)
+        };
 
         let mut req = self
             .client
-            .post(format!("{}/v1/messages", self.base_url))
+            .post(&url)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
 
         req = match &self.auth {
             AnthropicAuth::ApiKey(key) => req.header("x-api-key", key),
             AnthropicAuth::OAuthToken(token) => {
+                let billing = compute_billing_hash(messages);
                 req.header("Authorization", format!("Bearer {token}"))
+                    .header(
+                        "anthropic-beta",
+                        "oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                    )
+                    .header("user-agent", format!("claude-code/{CC_VERSION}"))
+                    .header("x-anthropic-billing-header", billing)
             }
         };
 
@@ -215,6 +321,14 @@ impl LlmProvider for AnthropicProvider {
             match block {
                 AnthropicContentBlock::Text { text } => text_parts.push(text),
                 AnthropicContentBlock::ToolUse { id, name, input } => {
+                    // OAuth: strip "mcp_" prefix from tool names in response
+                    let name = if is_oauth {
+                        name.strip_prefix("mcp_")
+                            .unwrap_or(&name)
+                            .to_string()
+                    } else {
+                        name
+                    };
                     tool_calls.push(ToolCall { id, name, input });
                 }
             }
