@@ -56,7 +56,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Run) | Some(Command::Chat) | Some(Command::Telegram) => {
+        Some(Command::Run) => {
+            if needs_setup(&cli.config) {
+                run_setup(cli.config).await
+            } else {
+                let config = load_config(&cli.config)?;
+                let workspace = cli
+                    .workspace
+                    .unwrap_or_else(|| config.workspace.clone())
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from("."));
+                info!("Workspace: {}", workspace.display());
+                run_gateway(config, workspace, cli.config.clone()).await
+            }
+        }
+        Some(Command::Chat) | Some(Command::Telegram) => {
             let config = load_config(&cli.config)?;
             let workspace = cli
                 .workspace
@@ -67,8 +81,8 @@ async fn main() -> Result<()> {
 
             match cli.command.unwrap() {
                 Command::Chat => run_chat(config, workspace).await,
-                Command::Run => run_gateway(config, workspace).await,
                 Command::Telegram => run_telegram(config, workspace).await,
+                _ => unreachable!(),
             }
         }
         None => {
@@ -115,7 +129,13 @@ fn needs_setup(config_path: &Path) -> bool {
     if !config_path.exists() {
         return true;
     }
-    // Config exists — still need setup if no API key is available
+    // Config exists — check if OAuth mode is configured (no API key needed)
+    if let Ok(content) = std::fs::read_to_string(config_path) {
+        if content.contains("auth_mode = \"oauth_token\"") {
+            return false;
+        }
+    }
+    // Otherwise need setup if no API key is available
     std::env::var("ANTHROPIC_API_KEY").is_err() && std::env::var("OPENAI_API_KEY").is_err()
 }
 
@@ -133,7 +153,7 @@ async fn run_setup(config_path: PathBuf) -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("."));
     info!("Workspace: {}", workspace.display());
 
-    run_gateway(config, workspace).await
+    run_gateway(config, workspace, config_path).await
 }
 
 fn load_config(path: &PathBuf) -> Result<Config> {
@@ -356,7 +376,7 @@ async fn run_chat(config: Config, workspace: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn run_gateway(config: Config, workspace: PathBuf) -> Result<()> {
+async fn run_gateway(config: Config, workspace: PathBuf, config_path: PathBuf) -> Result<()> {
     let llm = build_llm_provider(&config)?;
 
     // 1. Create mpsc channel for schedule commands
@@ -376,6 +396,8 @@ async fn run_gateway(config: Config, workspace: PathBuf) -> Result<()> {
         config.llm.max_iterations,
     ));
 
+    let skills = agent_runtime.skills.clone();
+
     let agent_id = AgentId("default".to_string());
 
     let session_dir = dirs_home().join(".closeclaw/sessions");
@@ -391,8 +413,13 @@ async fn run_gateway(config: Config, workspace: PathBuf) -> Result<()> {
     let bind = config.gateway.bind.clone();
     let port = config.gateway.port;
     let hub_wc = hub.clone();
+    let wc_skills = skills;
+    let wc_config = config.clone();
+    let wc_config_path = config_path;
     handles.push(tokio::spawn(async move {
-        if let Err(e) = closeclaw_channels::webchat::serve(hub_wc, &bind, port).await {
+        if let Err(e) = closeclaw_channels::webchat::serve(
+            hub_wc, wc_skills, wc_config, wc_config_path, &bind, port,
+        ).await {
             error!("WebChat error: {e}");
         }
     }));

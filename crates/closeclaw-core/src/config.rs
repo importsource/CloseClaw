@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub gateway: GatewayConfig,
     pub agents: Vec<AgentConfig>,
@@ -18,7 +18,7 @@ fn default_workspace() -> PathBuf {
     PathBuf::from(".")
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -43,7 +43,7 @@ impl Default for GatewayConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub id: String,
     #[serde(default)]
@@ -56,7 +56,7 @@ pub struct AgentConfig {
     pub skills_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelConfig {
     #[serde(rename = "type")]
     pub channel_type: ChannelType,
@@ -66,7 +66,7 @@ pub struct ChannelConfig {
     pub token_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelType {
     Cli,
@@ -94,7 +94,7 @@ fn default_enabled() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     #[serde(default = "default_provider")]
     pub provider: LlmProvider,
@@ -113,7 +113,7 @@ pub struct LlmConfig {
 }
 
 /// Authentication mode for the LLM provider.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
     /// Traditional API key auth (x-api-key header for Anthropic, Bearer for OpenAI)
@@ -138,7 +138,7 @@ fn default_max_iterations() -> usize {
     25
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum LlmProvider {
     Anthropic,
@@ -153,6 +153,10 @@ impl Config {
     pub fn from_file(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = std::fs::read_to_string(path)?;
         Ok(Self::from_toml(&content)?)
+    }
+
+    pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
     }
 }
 

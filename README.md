@@ -5,12 +5,15 @@ An agent framework in Rust. Build AI agents that use tools, persist sessions, an
 ## Features
 
 - **ReAct agent loop** — iterative reasoning + tool use (up to configurable max iterations)
+- **Streaming responses** — real-time token-by-token output via Anthropic SSE streaming
 - **Multi-channel** — CLI, WebChat (WebSocket), Telegram bot
 - **Multi-provider** — Anthropic (Claude) and OpenAI
 - **Built-in tools** — shell exec, file read/write, web fetch, web search, browser automation
 - **Session persistence** — JSONL-based conversation history per user
 - **Customizable personality** — SOUL.md system prompt + skill files
 - **OAuth support** — compatible with Claude Code's login flow + macOS Keychain
+- **Web admin UI** — sidebar-based SPA with Chat, Skills, and Config pages
+- **Dark/Light theme** — toggle between dark and light mode with persistent preference
 
 ## Quick Start
 
@@ -126,7 +129,13 @@ closeclaw chat
 
 ### WebChat
 
-A browser-based chat UI served over HTTP + WebSocket.
+A sidebar-based web app served over HTTP + WebSocket with three pages:
+
+- **Chat** — real-time streaming chat with markdown rendering and syntax highlighting
+- **Skills** — browse all loaded skills with name, emoji, description, and source
+- **Config** — view and edit LLM settings (provider, model, auth mode, max iterations)
+
+Supports dark and light themes with a toggle in the sidebar footer.
 
 ```bash
 closeclaw run
@@ -275,10 +284,10 @@ sudo systemctl enable --now closeclaw
 ```
 CloseClaw/
 ├── crates/
-│   ├── closeclaw-core/        # Traits & types (Agent, Tool, Channel, Config)
+│   ├── closeclaw-core/        # Traits & types (Agent, Tool, Channel, Config, Skills)
 │   ├── closeclaw-tools/       # Built-in tools (exec, file, web, browser)
-│   ├── closeclaw-agent/       # ReAct runtime, LLM providers, context builder
-│   ├── closeclaw-channels/    # CLI, WebChat, Telegram
+│   ├── closeclaw-agent/       # ReAct runtime, LLM providers (streaming), context builder
+│   ├── closeclaw-channels/    # CLI, WebChat (sidebar SPA), Telegram
 │   ├── closeclaw-gateway/     # Hub, router, session store, event bus
 │   └── closeclaw/             # Binary entry point
 ├── docs/

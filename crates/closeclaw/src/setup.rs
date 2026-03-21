@@ -20,7 +20,8 @@ struct SetupState {
 struct SetupForm {
     provider: String,
     model: String,
-    api_key: String,
+    auth_mode: String,
+    api_key: Option<String>,
     telegram_token: Option<String>,
 }
 
@@ -60,8 +61,13 @@ async fn handle_setup(
         _ => "ANTHROPIC_API_KEY",
     };
 
+    let use_oauth = form.auth_mode == "oauth_token";
+
     // Set env vars in-process so run_gateway() picks them up
-    std::env::set_var(env_var, &form.api_key);
+    if !use_oauth {
+        let api_key = form.api_key.as_deref().unwrap_or("");
+        std::env::set_var(env_var, api_key);
+    }
     if let Some(ref token) = &form.telegram_token {
         if !token.is_empty() {
             std::env::set_var("TELOXIDE_TOKEN", token);
@@ -71,13 +77,19 @@ async fn handle_setup(
     // Persist to ~/.closeclaw/.env
     let dotenv_dir = dirs_home().join(".closeclaw");
     let _ = std::fs::create_dir_all(&dotenv_dir);
-    let mut env_lines = vec![format!("{}={}", env_var, form.api_key)];
+    let mut env_lines: Vec<String> = Vec::new();
+    if !use_oauth {
+        let api_key = form.api_key.as_deref().unwrap_or("");
+        env_lines.push(format!("{env_var}={api_key}"));
+    }
     if let Some(ref token) = &form.telegram_token {
         if !token.is_empty() {
             env_lines.push(format!("TELOXIDE_TOKEN={token}"));
         }
     }
-    let _ = std::fs::write(dotenv_dir.join(".env"), env_lines.join("\n") + "\n");
+    if !env_lines.is_empty() {
+        let _ = std::fs::write(dotenv_dir.join(".env"), env_lines.join("\n") + "\n");
+    }
 
     // Write config.toml
     let telegram_section = match &form.telegram_token {
@@ -85,6 +97,32 @@ async fn handle_setup(
             "\n[[channels]]\ntype = \"telegram\"\nenabled = true\ntoken_env = \"TELOXIDE_TOKEN\"\n"
         }
         _ => "",
+    };
+
+    let llm_section = if use_oauth {
+        format!(
+            r#"[llm]
+provider = "{provider}"
+model = "{model}"
+auth_mode = "oauth_token"
+max_iterations = 25
+"#,
+            provider = form.provider,
+            model = form.model,
+        )
+    } else {
+        format!(
+            r#"[llm]
+provider = "{provider}"
+model = "{model}"
+auth_mode = "api_key"
+api_key_env = "{env_var}"
+max_iterations = 25
+"#,
+            provider = form.provider,
+            model = form.model,
+            env_var = env_var,
+        )
     };
 
     let config_content = format!(
@@ -101,17 +139,9 @@ tools = ["exec", "read_file", "write_file", "web_fetch", "web_search", "list_fil
 type = "webchat"
 enabled = true
 {telegram_section}
-[llm]
-provider = "{provider}"
-model = "{model}"
-auth_mode = "api_key"
-api_key_env = "{env_var}"
-max_iterations = 25
-"#,
-        provider = form.provider,
-        model = form.model,
-        env_var = env_var,
+{llm_section}"#,
         telegram_section = telegram_section,
+        llm_section = llm_section,
     );
 
     let _ = std::fs::write(&state.config_path, config_content);
@@ -157,16 +187,30 @@ const SETUP_HTML: &str = r#"<!DOCTYPE html>
     <p class="sub">Configure your agent to get started.</p>
 
     <label>Provider</label>
-    <select id="provider" onchange="updateModels()">
+    <select id="provider" onchange="updateProvider()">
       <option value="anthropic">Anthropic</option>
       <option value="openai">OpenAI</option>
     </select>
 
+    <div id="auth_mode_group">
+      <label>Auth Mode</label>
+      <select id="auth_mode" onchange="updateAuthMode()">
+        <option value="api_key">API Key</option>
+        <option value="oauth_token">Claude Subscription (OAuth)</option>
+      </select>
+    </div>
+
     <label>Model</label>
     <select id="model"></select>
 
-    <label>API Key</label>
-    <input id="api_key" type="password" placeholder="sk-..." />
+    <div id="api_key_group">
+      <label>API Key</label>
+      <input id="api_key" type="password" placeholder="sk-..." />
+    </div>
+
+    <div id="oauth_note" style="display:none; margin-top:1rem; padding:0.75rem; background:#16213e; border-radius:4px; font-size:0.85rem; opacity:0.8;">
+      Requires <code style="background:#1a1a2e; padding:0.1rem 0.4rem; border-radius:3px;">claude login</code> first. Token is read from macOS Keychain automatically.
+    </div>
 
     <label>Telegram Bot Token <span class="optional">(optional)</span></label>
     <input id="telegram_token" placeholder="123456:ABC-DEF..." />
@@ -199,13 +243,32 @@ const SETUP_HTML: &str = r#"<!DOCTYPE html>
         sel.appendChild(opt);
       }
     }
-    updateModels();
+
+    function updateAuthMode() {
+      const authMode = document.getElementById("auth_mode").value;
+      const isOAuth = authMode === "oauth_token";
+      document.getElementById("api_key_group").style.display = isOAuth ? "none" : "block";
+      document.getElementById("oauth_note").style.display = isOAuth ? "block" : "none";
+    }
+
+    function updateProvider() {
+      const prov = document.getElementById("provider").value;
+      const isAnthropic = prov === "anthropic";
+      document.getElementById("auth_mode_group").style.display = isAnthropic ? "block" : "none";
+      if (!isAnthropic) {
+        document.getElementById("auth_mode").value = "api_key";
+        updateAuthMode();
+      }
+      updateModels();
+    }
+    updateProvider();
 
     async function submit() {
       const btn = document.getElementById("btn");
       const status = document.getElementById("status");
+      const authMode = document.getElementById("auth_mode").value;
       const apiKey = document.getElementById("api_key").value.trim();
-      if (!apiKey) { status.textContent = "API key is required."; return; }
+      if (authMode === "api_key" && !apiKey) { status.textContent = "API key is required."; return; }
 
       btn.disabled = true;
       btn.textContent = "Saving...";
@@ -214,7 +277,8 @@ const SETUP_HTML: &str = r#"<!DOCTYPE html>
       const body = {
         provider: document.getElementById("provider").value,
         model: document.getElementById("model").value,
-        api_key: apiKey,
+        auth_mode: authMode,
+        api_key: authMode === "api_key" ? apiKey : null,
         telegram_token: document.getElementById("telegram_token").value.trim() || null
       };
 

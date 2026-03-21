@@ -3,21 +3,29 @@ use axum::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::Html,
-    routing::get,
+    http::StatusCode,
+    response::{Html, Json},
+    routing::{get, post},
     Router,
 };
+use closeclaw_core::config::Config;
+use closeclaw_core::skill::Skill;
 use closeclaw_core::types::{
-    ChannelId, Message, MessageContent, Sender, SessionId,
+    ChannelId, Event, Message, MessageContent, Sender, SessionId,
 };
 use closeclaw_gateway::hub::Hub;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{error, info};
 
 #[derive(Clone)]
 struct AppState {
     hub: Arc<Hub>,
+    skills: Arc<Vec<Skill>>,
+    config: Arc<RwLock<Config>>,
+    config_path: Arc<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -27,11 +35,26 @@ struct ChatMsg {
     content: String,
 }
 
-pub async fn serve(hub: Arc<Hub>, bind: &str, port: u16) -> anyhow::Result<()> {
-    let state = AppState { hub };
+pub async fn serve(
+    hub: Arc<Hub>,
+    skills: Vec<Skill>,
+    config: Config,
+    config_path: PathBuf,
+    bind: &str,
+    port: u16,
+) -> anyhow::Result<()> {
+    let state = AppState {
+        hub,
+        skills: Arc::new(skills),
+        config: Arc::new(RwLock::new(config)),
+        config_path: Arc::new(config_path),
+    };
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/ws", get(ws_handler))
+        .route("/api/skills", get(skills_handler))
+        .route("/api/config", get(config_get_handler))
+        .route("/api/config", post(config_post_handler))
         .with_state(state);
 
     let addr = format!("{bind}:{port}");
@@ -72,6 +95,11 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             continue;
         }
 
+        // Send typing indicator immediately
+        let _ = socket
+            .send(WsMessage::Text(r#"{"type":"typing"}"#.into()))
+            .await;
+
         let msg = Message {
             id: uuid::Uuid::new_v4().to_string(),
             session_id: session_id.clone(),
@@ -84,22 +112,72 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
             timestamp: chrono::Utc::now(),
         };
 
-        let response = match state.hub.handle_message(msg).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Agent error: {e}");
-                format!("Error: {e}")
-            }
-        };
+        // Subscribe to events before processing, so we don't miss any
+        let mut event_rx = state.hub.subscribe_events();
+        let sid = session_id.clone();
 
-        let reply = ChatMsg {
-            msg_type: "response".to_string(),
-            content: response,
-        };
+        // Spawn hub processing in background
+        let hub = state.hub.clone();
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = hub.handle_message(msg).await;
+            let _ = result_tx.send(result);
+        });
 
-        if let Ok(json) = serde_json::to_string(&reply) {
-            if socket.send(WsMessage::Text(json.into())).await.is_err() {
-                break;
+        // Forward events in real-time until result arrives
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    if let Ok(event) = event {
+                        match &event {
+                            Event::TextDelta { session_id: s, text } if *s == sid => {
+                                let json = serde_json::json!({
+                                    "type": "text_delta",
+                                    "content": text,
+                                });
+                                if socket.send(WsMessage::Text(json.to_string().into())).await.is_err() {
+                                    return; // client disconnected
+                                }
+                            }
+                            Event::ToolInvoked { session_id: s, tool, .. } if *s == sid => {
+                                let json = serde_json::json!({
+                                    "type": "tool_invoked",
+                                    "tool": tool,
+                                });
+                                let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                            }
+                            Event::ToolResult { session_id: s, tool, is_error, .. } if *s == sid => {
+                                let json = serde_json::json!({
+                                    "type": "tool_result",
+                                    "tool": tool,
+                                    "is_error": is_error,
+                                });
+                                let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                result = &mut result_rx => {
+                    let response = match result {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            error!("Agent error: {e}");
+                            format!("Error: {e}")
+                        }
+                        Err(_) => "Internal error".to_string(),
+                    };
+                    let reply = ChatMsg {
+                        msg_type: "response".to_string(),
+                        content: response,
+                    };
+                    if let Ok(json) = serde_json::to_string(&reply) {
+                        if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    break;
+                }
             }
         }
     }
@@ -107,60 +185,623 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     info!("WebSocket disconnected: session {session_id}");
 }
 
-const CHAT_HTML: &str = r#"<!DOCTYPE html>
-<html>
+// ── API handlers ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SkillInfo {
+    name: String,
+    description: String,
+    emoji: Option<String>,
+    source: String,
+    slug: String,
+    user_invocable: bool,
+}
+
+async fn skills_handler(State(state): State<AppState>) -> Json<Vec<SkillInfo>> {
+    let skills: Vec<SkillInfo> = state
+        .skills
+        .iter()
+        .map(|s| SkillInfo {
+            name: s.name.clone(),
+            description: s.description.clone(),
+            emoji: s.metadata.get("emoji").cloned(),
+            source: format!("{:?}", s.source),
+            slug: s.slug(),
+            user_invocable: s.user_invocable,
+        })
+        .collect();
+    Json(skills)
+}
+
+#[derive(Serialize)]
+struct LlmConfigResponse {
+    provider: String,
+    model: String,
+    auth_mode: String,
+    max_iterations: usize,
+}
+
+async fn config_get_handler(State(state): State<AppState>) -> Json<LlmConfigResponse> {
+    let cfg = state.config.read().await;
+    Json(LlmConfigResponse {
+        provider: format!("{:?}", cfg.llm.provider).to_lowercase(),
+        model: cfg.llm.model.clone(),
+        auth_mode: match cfg.llm.auth_mode {
+            closeclaw_core::config::AuthMode::ApiKey => "api_key".to_string(),
+            closeclaw_core::config::AuthMode::OauthToken => "oauth_token".to_string(),
+        },
+        max_iterations: cfg.llm.max_iterations,
+    })
+}
+
+#[derive(Deserialize)]
+struct LlmConfigUpdate {
+    provider: Option<String>,
+    model: Option<String>,
+    auth_mode: Option<String>,
+    max_iterations: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ConfigSaveResponse {
+    success: bool,
+    message: String,
+    restart_required: bool,
+}
+
+async fn config_post_handler(
+    State(state): State<AppState>,
+    Json(update): Json<LlmConfigUpdate>,
+) -> Result<Json<ConfigSaveResponse>, StatusCode> {
+    let mut cfg = state.config.write().await;
+
+    let mut restart_required = false;
+
+    if let Some(ref provider) = update.provider {
+        match provider.as_str() {
+            "anthropic" => {
+                if cfg.llm.provider != closeclaw_core::config::LlmProvider::Anthropic {
+                    cfg.llm.provider = closeclaw_core::config::LlmProvider::Anthropic;
+                    restart_required = true;
+                }
+            }
+            "openai" => {
+                if cfg.llm.provider != closeclaw_core::config::LlmProvider::Openai {
+                    cfg.llm.provider = closeclaw_core::config::LlmProvider::Openai;
+                    restart_required = true;
+                }
+            }
+            _ => return Err(StatusCode::BAD_REQUEST),
+        }
+    }
+
+    if let Some(ref model) = update.model {
+        if cfg.llm.model != *model {
+            cfg.llm.model = model.clone();
+            restart_required = true;
+        }
+    }
+
+    if let Some(ref auth_mode) = update.auth_mode {
+        match auth_mode.as_str() {
+            "api_key" => {
+                if cfg.llm.auth_mode != closeclaw_core::config::AuthMode::ApiKey {
+                    cfg.llm.auth_mode = closeclaw_core::config::AuthMode::ApiKey;
+                    restart_required = true;
+                }
+            }
+            "oauth_token" => {
+                if cfg.llm.auth_mode != closeclaw_core::config::AuthMode::OauthToken {
+                    cfg.llm.auth_mode = closeclaw_core::config::AuthMode::OauthToken;
+                    restart_required = true;
+                }
+            }
+            _ => return Err(StatusCode::BAD_REQUEST),
+        }
+    }
+
+    if let Some(max_iter) = update.max_iterations {
+        cfg.llm.max_iterations = max_iter;
+    }
+
+    match cfg.to_toml() {
+        Ok(toml_str) => {
+            if let Err(e) = std::fs::write(state.config_path.as_ref(), &toml_str) {
+                error!("Failed to write config: {e}");
+                return Ok(Json(ConfigSaveResponse {
+                    success: false,
+                    message: format!("Failed to write config file: {e}"),
+                    restart_required: false,
+                }));
+            }
+        }
+        Err(e) => {
+            error!("Failed to serialize config: {e}");
+            return Ok(Json(ConfigSaveResponse {
+                success: false,
+                message: format!("Failed to serialize config: {e}"),
+                restart_required: false,
+            }));
+        }
+    }
+
+    let message = if restart_required {
+        "Config saved. Restart required for changes to take effect.".to_string()
+    } else {
+        "Config saved.".to_string()
+    };
+
+    Ok(Json(ConfigSaveResponse {
+        success: true,
+        message,
+        restart_required,
+    }))
+}
+
+// ── HTML SPA ────────────────────────────────────────────────────────────
+
+const CHAT_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
 <head>
-  <title>CloseClaw Chat</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CloseClaw</title>
+  <link id="hljs-theme" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <style>
+    /* ── Theme variables ─────────────────────────────────────────────── */
+    :root, [data-theme="dark"] {
+      --bg-body: #1a1a2e;
+      --bg-sidebar: #0f0f23;
+      --bg-card: #16213e;
+      --bg-input: #16213e;
+      --bg-code: #0d1b2a;
+      --border: #2a2a4a;
+      --text-primary: #eee;
+      --text-secondary: #aaa;
+      --text-muted: #888;
+      --text-dim: #555;
+      --text-heading: #fff;
+      --accent: #e94560;
+      --accent-hover: #c73e54;
+      --msg-user: #0f3460;
+      --msg-agent: #16213e;
+      --msg-agent-border: #2a2a4a;
+      --link-color: #7dd3fc;
+      --code-text: #7dd3fc;
+      --code-block-text: #ddd;
+      --blockquote-text: #bbb;
+      --blockquote-bg: rgba(255,255,255,0.03);
+      --table-header-bg: #0f3460;
+      --tool-bg: #0f3460;
+      --tool-text: #7dd3fc;
+      --tool-done-bg: #065f46;
+      --tool-done-text: #6ee7b7;
+      --badge-source-bg: #533483;
+      --badge-source-text: #ddd;
+      --badge-slug-bg: #0f3460;
+      --badge-slug-text: #7dd3fc;
+      --badge-inv-bg: #065f46;
+      --badge-inv-text: #6ee7b7;
+      --success-bg: #065f46; --success-text: #6ee7b7; --success-border: #10b981;
+      --error-bg: #7f1d1d; --error-text: #fca5a5; --error-border: #ef4444;
+      --warning-bg: #78350f; --warning-text: #fde68a; --warning-border: #f59e0b;
+      --ws-ok-text: #4ade80; --ws-ok-bg: #065f46;
+      --ws-err-text: #f87171; --ws-err-bg: #7f1d1d;
+    }
+    [data-theme="light"] {
+      --bg-body: #f0f2f5;
+      --bg-sidebar: #ffffff;
+      --bg-card: #ffffff;
+      --bg-input: #ffffff;
+      --bg-code: #f6f8fa;
+      --border: #d8dce3;
+      --text-primary: #1a1a2e;
+      --text-secondary: #555;
+      --text-muted: #888;
+      --text-dim: #bbb;
+      --text-heading: #111;
+      --accent: #e94560;
+      --accent-hover: #c73e54;
+      --msg-user: #dbeafe;
+      --msg-agent: #ffffff;
+      --msg-agent-border: #d8dce3;
+      --link-color: #2563eb;
+      --code-text: #d63384;
+      --code-block-text: #24292e;
+      --blockquote-text: #555;
+      --blockquote-bg: rgba(0,0,0,0.03);
+      --table-header-bg: #f0f2f5;
+      --tool-bg: #dbeafe;
+      --tool-text: #1d4ed8;
+      --tool-done-bg: #dcfce7;
+      --tool-done-text: #15803d;
+      --badge-source-bg: #ede9fe;
+      --badge-source-text: #6d28d9;
+      --badge-slug-bg: #dbeafe;
+      --badge-slug-text: #1d4ed8;
+      --badge-inv-bg: #dcfce7;
+      --badge-inv-text: #15803d;
+      --success-bg: #dcfce7; --success-text: #15803d; --success-border: #86efac;
+      --error-bg: #fee2e2; --error-text: #b91c1c; --error-border: #fca5a5;
+      --warning-bg: #fef3c7; --warning-text: #92400e; --warning-border: #fcd34d;
+      --ws-ok-text: #15803d; --ws-ok-bg: #dcfce7;
+      --ws-err-text: #b91c1c; --ws-err-bg: #fee2e2;
+    }
+
+    /* ── Base ─────────────────────────────────────────────────────────── */
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #eee; display: flex; justify-content: center; padding: 2rem; }
-    .chat { max-width: 700px; width: 100%; }
-    h1 { margin-bottom: 1rem; color: #e94560; }
-    #messages { background: #16213e; border-radius: 8px; padding: 1rem; height: 60vh; overflow-y: auto; margin-bottom: 1rem; }
-    .msg { margin-bottom: 0.5rem; padding: 0.5rem; border-radius: 4px; }
-    .msg.user { background: #0f3460; }
-    .msg.agent { background: #533483; }
-    .msg .label { font-size: 0.75rem; opacity: 0.7; margin-bottom: 0.25rem; }
-    .input-row { display: flex; gap: 0.5rem; }
-    input { flex: 1; padding: 0.75rem; border: none; border-radius: 4px; background: #16213e; color: #eee; font-size: 1rem; }
-    button { padding: 0.75rem 1.5rem; border: none; border-radius: 4px; background: #e94560; color: #fff; font-size: 1rem; cursor: pointer; }
-    button:hover { background: #c73e54; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg-body); color: var(--text-primary); display: flex; height: 100vh; overflow: hidden; transition: background 0.2s, color 0.2s; }
+
+    /* ── Sidebar ──────────────────────────────────────────────────────── */
+    .sidebar { width: 220px; background: var(--bg-sidebar); display: flex; flex-direction: column; border-right: 1px solid var(--border); flex-shrink: 0; transition: background 0.2s; }
+    .sidebar-logo { padding: 1.25rem 1rem; font-size: 1.25rem; font-weight: 700; color: var(--accent); border-bottom: 1px solid var(--border); letter-spacing: 0.5px; }
+    .sidebar-nav { flex: 1; padding: 0.75rem 0; }
+    .nav-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.7rem 1rem; cursor: pointer; color: var(--text-secondary); transition: all 0.15s; border-left: 3px solid transparent; font-size: 0.95rem; }
+    .nav-item:hover { background: var(--bg-card); color: var(--text-primary); }
+    .nav-item.active { background: var(--bg-card); color: var(--accent); border-left-color: var(--accent); }
+    .nav-icon { font-size: 1.1rem; width: 1.5rem; text-align: center; }
+    .sidebar-footer { padding: 0.75rem 1rem; border-top: 1px solid var(--border); font-size: 0.75rem; color: var(--text-dim); display: flex; align-items: center; justify-content: space-between; }
+    .theme-toggle { background: none; border: 1px solid var(--border); border-radius: 6px; padding: 0.3rem 0.5rem; cursor: pointer; font-size: 1rem; line-height: 1; color: var(--text-secondary); transition: all 0.15s; }
+    .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── Content ──────────────────────────────────────────────────────── */
+    .content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    .page { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+    .page.active { display: flex; }
+
+    /* ── Chat ─────────────────────────────────────────────────────────── */
+    .chat-page { padding: 0; }
+    .chat-header { padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); font-size: 1.1rem; font-weight: 600; display: flex; align-items: center; gap: 0.75rem; }
+    #messages { flex: 1; overflow-y: auto; padding: 1rem 1.5rem; }
+    .msg { margin-bottom: 0.75rem; padding: 0.75rem 1rem; border-radius: 8px; max-width: 85%; line-height: 1.5; transition: background 0.2s; }
+    .msg.user { background: var(--msg-user); margin-left: auto; }
+    .msg.agent { background: var(--msg-agent); border: 1px solid var(--msg-agent-border); }
+    .msg .label { font-size: 0.7rem; opacity: 0.6; margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 0.5px; }
+    .msg .text { word-wrap: break-word; }
+    .msg.user .text { white-space: pre-wrap; }
+    .msg.agent .text { line-height: 1.6; }
+    .msg.agent .text p { margin-bottom: 0.5em; }
+    .msg.agent .text p:last-child { margin-bottom: 0; }
+    .msg.agent .text h1, .msg.agent .text h2, .msg.agent .text h3,
+    .msg.agent .text h4, .msg.agent .text h5, .msg.agent .text h6 {
+      margin: 0.75em 0 0.4em; font-weight: 600; color: var(--text-heading); line-height: 1.3;
+    }
+    .msg.agent .text h1 { font-size: 1.3em; } .msg.agent .text h2 { font-size: 1.15em; } .msg.agent .text h3 { font-size: 1.05em; }
+    .msg.agent .text ul, .msg.agent .text ol { margin: 0.4em 0; padding-left: 1.5em; }
+    .msg.agent .text li { margin-bottom: 0.25em; } .msg.agent .text li > p { margin-bottom: 0.2em; }
+    .msg.agent .text blockquote { border-left: 3px solid var(--accent); margin: 0.5em 0; padding: 0.25em 0.75em; color: var(--blockquote-text); background: var(--blockquote-bg); border-radius: 0 4px 4px 0; }
+    .msg.agent .text code { background: var(--bg-code); padding: 0.15em 0.35em; border-radius: 3px; font-size: 0.88em; font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; color: var(--code-text); }
+    .msg.agent .text pre { background: var(--bg-code); border: 1px solid var(--border); border-radius: 6px; padding: 0.75em 1em; margin: 0.5em 0; overflow-x: auto; }
+    .msg.agent .text pre code { background: none; padding: 0; color: var(--code-block-text); font-size: 0.85em; }
+    .msg.agent .text table { border-collapse: collapse; margin: 0.5em 0; width: 100%; }
+    .msg.agent .text th, .msg.agent .text td { border: 1px solid var(--border); padding: 0.4em 0.6em; text-align: left; font-size: 0.9em; }
+    .msg.agent .text th { background: var(--table-header-bg); font-weight: 600; }
+    .msg.agent .text hr { border: none; border-top: 1px solid var(--border); margin: 0.75em 0; }
+    .msg.agent .text a { color: var(--link-color); text-decoration: none; } .msg.agent .text a:hover { text-decoration: underline; }
+    .msg.agent .text img { max-width: 100%; border-radius: 6px; margin: 0.5em 0; }
+    .msg.agent .text.streaming { white-space: pre-wrap; }
+    .chat-input { display: flex; gap: 0.5rem; padding: 1rem 1.5rem; border-top: 1px solid var(--border); background: var(--bg-sidebar); transition: background 0.2s; }
+    .chat-input input { flex: 1; padding: 0.75rem 1rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-input); color: var(--text-primary); font-size: 0.95rem; outline: none; transition: background 0.2s, color 0.2s; }
+    .chat-input input:focus { border-color: var(--accent); }
+    .chat-input button { padding: 0.75rem 1.5rem; border: none; border-radius: 8px; background: var(--accent); color: #fff; font-size: 0.95rem; cursor: pointer; font-weight: 500; }
+    .chat-input button:hover { background: var(--accent-hover); }
+    .chat-input button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #ws-status { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 4px; }
+    .ws-connected { color: var(--ws-ok-text); background: var(--ws-ok-bg); }
+    .ws-disconnected { color: var(--ws-err-text); background: var(--ws-err-bg); }
+
+    /* ── Typing ───────────────────────────────────────────────────────── */
+    .typing-indicator { display: none; padding: 0.75rem 1rem; margin-bottom: 0.75rem; max-width: 85%; }
+    .typing-indicator.visible { display: block; }
+    .typing-dots { display: inline-flex; gap: 4px; align-items: center; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 1rem; }
+    .typing-dots span { width: 6px; height: 6px; background: var(--accent); border-radius: 50%; animation: bounce 1.2s ease-in-out infinite; }
+    .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+    .typing-label { font-size: 0.7rem; color: var(--text-muted); margin-top: 0.3rem; }
+    @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-6px); } }
+
+    /* ── Tool activity ────────────────────────────────────────────────── */
+    .tool-activity { font-size: 0.8rem; color: var(--tool-text); background: var(--tool-bg); border-radius: 6px; padding: 0.4rem 0.75rem; margin-bottom: 0.5rem; max-width: 85%; display: flex; align-items: center; gap: 0.5rem; }
+    .tool-activity .spinner { width: 12px; height: 12px; border: 2px solid var(--tool-text); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .tool-done { color: var(--tool-done-text); background: var(--tool-done-bg); }
+
+    /* ── Skills ────────────────────────────────────────────────────────── */
+    .skills-page { padding: 1.5rem; overflow-y: auto; }
+    .skills-header { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; }
+    .skills-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }
+    .skill-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem; transition: border-color 0.15s, background 0.2s; }
+    .skill-card:hover { border-color: var(--accent); }
+    .skill-card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
+    .skill-emoji { font-size: 1.5rem; } .skill-name { font-weight: 600; font-size: 1rem; }
+    .skill-desc { color: var(--text-secondary); font-size: 0.85rem; line-height: 1.4; margin-bottom: 0.75rem; }
+    .skill-badges { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .badge { font-size: 0.7rem; padding: 0.2rem 0.5rem; border-radius: 4px; font-family: monospace; }
+    .badge-source { background: var(--badge-source-bg); color: var(--badge-source-text); }
+    .badge-slug { background: var(--badge-slug-bg); color: var(--badge-slug-text); }
+    .badge-invocable { background: var(--badge-inv-bg); color: var(--badge-inv-text); }
+    .skills-empty { color: var(--text-dim); font-style: italic; padding: 2rem 0; }
+
+    /* ── Config ────────────────────────────────────────────────────────── */
+    .config-page { padding: 1.5rem; overflow-y: auto; }
+    .config-header { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; }
+    .config-form { max-width: 500px; }
+    .form-group { margin-bottom: 1.25rem; }
+    .form-group label { display: block; font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 0.35rem; font-weight: 500; }
+    .form-group select, .form-group input { width: 100%; padding: 0.65rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-input); color: var(--text-primary); font-size: 0.9rem; outline: none; transition: background 0.2s, color 0.2s; }
+    .form-group select:focus, .form-group input:focus { border-color: var(--accent); }
+    .config-save-btn { padding: 0.7rem 1.5rem; border: none; border-radius: 8px; background: var(--accent); color: #fff; font-size: 0.9rem; cursor: pointer; font-weight: 500; }
+    .config-save-btn:hover { background: var(--accent-hover); }
+    .config-save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .config-notice { margin-top: 1rem; padding: 0.75rem 1rem; border-radius: 6px; font-size: 0.85rem; display: none; }
+    .config-notice.success { display: block; background: var(--success-bg); color: var(--success-text); border: 1px solid var(--success-border); }
+    .config-notice.error { display: block; background: var(--error-bg); color: var(--error-text); border: 1px solid var(--error-border); }
+    .config-notice.warning { display: block; background: var(--warning-bg); color: var(--warning-text); border: 1px solid var(--warning-border); }
   </style>
 </head>
 <body>
-  <div class="chat">
-    <h1>CloseClaw</h1>
-    <div id="messages"></div>
-    <div class="input-row">
-      <input id="input" placeholder="Type a message..." onkeydown="if(event.key==='Enter')send()" autofocus />
-      <button onclick="send()">Send</button>
+  <div class="sidebar">
+    <div class="sidebar-logo">CloseClaw</div>
+    <nav class="sidebar-nav">
+      <div class="nav-item active" data-page="chat">
+        <span class="nav-icon">&#128172;</span> Chat
+      </div>
+      <div class="nav-item" data-page="skills">
+        <span class="nav-icon">&#9889;</span> Skills
+      </div>
+      <div class="nav-item" data-page="config">
+        <span class="nav-icon">&#9881;</span> Config
+      </div>
+    </nav>
+    <div class="sidebar-footer">
+      <span>CloseClaw</span>
+      <button class="theme-toggle" id="theme-toggle" title="Toggle theme">&#127769;</button>
     </div>
   </div>
-  <script>
-    const ws = new WebSocket(`ws://${location.host}/ws`);
-    const messages = document.getElementById('messages');
-    const input = document.getElementById('input');
 
-    function addMsg(role, text) {
-      const d = document.createElement('div');
-      d.className = `msg ${role}`;
-      d.innerHTML = `<div class="label">${role}</div><div>${text.replace(/\n/g, '<br>')}</div>`;
-      messages.appendChild(d);
-      messages.scrollTop = messages.scrollHeight;
+  <div class="content">
+    <div id="page-chat" class="page chat-page active">
+      <div class="chat-header">
+        Chat
+        <span id="ws-status" class="ws-disconnected">disconnected</span>
+      </div>
+      <div id="messages">
+        <div id="typing-indicator" class="typing-indicator">
+          <div class="typing-dots"><span></span><span></span><span></span></div>
+          <div class="typing-label" id="typing-label">Thinking...</div>
+        </div>
+      </div>
+      <div class="chat-input">
+        <input id="input" placeholder="Type a message..." autofocus />
+        <button id="send-btn" onclick="sendMsg()">Send</button>
+      </div>
+    </div>
+
+    <div id="page-skills" class="page skills-page">
+      <div class="skills-header">Loaded Skills</div>
+      <div id="skills-grid" class="skills-grid">
+        <div class="skills-empty">Loading skills...</div>
+      </div>
+    </div>
+
+    <div id="page-config" class="page config-page">
+      <div class="config-header">LLM Configuration</div>
+      <div class="config-form">
+        <div class="form-group">
+          <label>Provider</label>
+          <select id="cfg-provider">
+            <option value="anthropic">Anthropic</option>
+            <option value="openai">OpenAI</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Model</label>
+          <input id="cfg-model" type="text" placeholder="claude-sonnet-4-20250514" />
+        </div>
+        <div class="form-group">
+          <label>Auth Mode</label>
+          <select id="cfg-auth-mode">
+            <option value="api_key">API Key</option>
+            <option value="oauth_token">OAuth Token</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Max Iterations</label>
+          <input id="cfg-max-iter" type="number" min="1" max="100" />
+        </div>
+        <button class="config-save-btn" onclick="saveConfig()">Save Config</button>
+        <div id="config-notice" class="config-notice"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>
+    // ── Theme ────────────────────────────────────────────────────────────
+    const HLJS_DARK = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css';
+    const HLJS_LIGHT = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css';
+
+    function getTheme() {
+      return localStorage.getItem('closeclaw-theme') || 'dark';
+    }
+    function applyTheme(theme) {
+      document.documentElement.setAttribute('data-theme', theme);
+      document.getElementById('hljs-theme').href = theme === 'dark' ? HLJS_DARK : HLJS_LIGHT;
+      document.getElementById('theme-toggle').innerHTML = theme === 'dark' ? '&#127769;' : '&#9728;&#65039;';
+      localStorage.setItem('closeclaw-theme', theme);
+    }
+    applyTheme(getTheme());
+
+    document.getElementById('theme-toggle').addEventListener('click', () => {
+      applyTheme(getTheme() === 'dark' ? 'light' : 'dark');
+    });
+
+    // ── Markdown setup ──────────────────────────────────────────────────
+    marked.setOptions({
+      highlight: function(code, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          return hljs.highlight(code, { language: lang }).value;
+        }
+        return hljs.highlightAuto(code).value;
+      },
+      breaks: true,
+      gfm: true,
+    });
+    function renderMarkdown(text) { return marked.parse(text); }
+
+    // ── Navigation ──────────────────────────────────────────────────────
+    const navItems = document.querySelectorAll('.nav-item');
+    const pages = document.querySelectorAll('.page');
+    navItems.forEach(item => {
+      item.addEventListener('click', () => {
+        navItems.forEach(n => n.classList.remove('active'));
+        pages.forEach(p => p.classList.remove('active'));
+        item.classList.add('active');
+        document.getElementById('page-' + item.dataset.page).classList.add('active');
+        if (item.dataset.page === 'skills') loadSkills();
+        if (item.dataset.page === 'config') loadConfig();
+      });
+    });
+
+    // ── WebSocket Chat ──────────────────────────────────────────────────
+    const messagesEl = document.getElementById('messages');
+    const inputEl = document.getElementById('input');
+    const sendBtn = document.getElementById('send-btn');
+    const wsStatus = document.getElementById('ws-status');
+    const typingIndicator = document.getElementById('typing-indicator');
+    const typingLabel = document.getElementById('typing-label');
+    let ws, reconnectTimer, isProcessing = false, streamingMsgEl = null;
+
+    function connectWs() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/ws`);
+      ws.onopen = () => { wsStatus.textContent = 'connected'; wsStatus.className = 'ws-connected'; };
+      ws.onclose = () => { wsStatus.textContent = 'disconnected'; wsStatus.className = 'ws-disconnected'; clearTimeout(reconnectTimer); reconnectTimer = setTimeout(connectWs, 2000); };
+      ws.onerror = () => { ws.close(); };
+      ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        switch (data.type) {
+          case 'typing': showTyping('Thinking...'); break;
+          case 'text_delta': hideTyping(); appendStreamDelta(data.content); break;
+          case 'tool_invoked': showToolActivity(data.tool); break;
+          case 'tool_result': markToolDone(data.tool, data.is_error); break;
+          case 'response': finishResponse(data.content); break;
+        }
+      };
+    }
+    connectWs();
+
+    function showTyping(label) { typingLabel.textContent = label; typingIndicator.classList.add('visible'); scrollToBottom(); }
+    function hideTyping() { typingIndicator.classList.remove('visible'); }
+
+    function showToolActivity(toolName) {
+      hideTyping(); finalizeStreamingMsg();
+      const el = document.createElement('div');
+      el.className = 'tool-activity'; el.dataset.tool = toolName;
+      el.innerHTML = '<div class="spinner"></div> Using ' + esc(toolName) + '...';
+      messagesEl.insertBefore(el, typingIndicator);
+      showTyping('Working...');
+    }
+    function markToolDone(toolName, isError) {
+      const els = messagesEl.querySelectorAll('.tool-activity[data-tool="' + toolName + '"]');
+      const el = els[els.length - 1];
+      if (el) { el.classList.add('tool-done'); el.innerHTML = (isError ? '&#10060; ' : '&#10003; ') + esc(toolName) + ' done'; }
     }
 
-    ws.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      if (data.type === 'response') addMsg('agent', data.content);
-    };
+    function appendStreamDelta(text) {
+      if (!streamingMsgEl) {
+        streamingMsgEl = document.createElement('div');
+        streamingMsgEl.className = 'msg agent';
+        streamingMsgEl.innerHTML = '<div class="label">agent</div><div class="text streaming"></div>';
+        messagesEl.insertBefore(streamingMsgEl, typingIndicator);
+      }
+      streamingMsgEl.querySelector('.text').textContent += text;
+      scrollToBottom();
+    }
+    function finalizeStreamingMsg() { streamingMsgEl = null; }
 
-    function send() {
-      const text = input.value.trim();
-      if (!text) return;
+    function finishResponse(fullText) {
+      hideTyping();
+      if (streamingMsgEl) {
+        const t = streamingMsgEl.querySelector('.text');
+        t.classList.remove('streaming'); t.innerHTML = renderMarkdown(fullText);
+        finalizeStreamingMsg();
+      } else { addAgentMsg(fullText); }
+      isProcessing = false; sendBtn.disabled = false; inputEl.disabled = false; inputEl.focus(); scrollToBottom();
+    }
+
+    function addAgentMsg(text) {
+      const d = document.createElement('div'); d.className = 'msg agent';
+      d.innerHTML = '<div class="label">agent</div><div class="text"></div>';
+      d.querySelector('.text').innerHTML = renderMarkdown(text);
+      messagesEl.insertBefore(d, typingIndicator); scrollToBottom();
+    }
+    function addMsg(role, text) {
+      if (role === 'agent') { addAgentMsg(text); return; }
+      const d = document.createElement('div'); d.className = 'msg ' + role;
+      d.innerHTML = '<div class="label">' + role + '</div><div class="text"></div>';
+      d.querySelector('.text').textContent = text;
+      messagesEl.insertBefore(d, typingIndicator); scrollToBottom();
+    }
+    function scrollToBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
+
+    function sendMsg() {
+      const text = inputEl.value.trim();
+      if (!text || !ws || ws.readyState !== WebSocket.OPEN || isProcessing) return;
+      isProcessing = true; sendBtn.disabled = true; inputEl.disabled = true;
       addMsg('user', text);
       ws.send(JSON.stringify({ type: 'message', content: text }));
-      input.value = '';
+      inputEl.value = '';
     }
+    inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMsg(); });
+
+    // ── Skills ──────────────────────────────────────────────────────────
+    let skillsLoaded = false;
+    async function loadSkills() {
+      if (skillsLoaded) return;
+      try {
+        const res = await fetch('/api/skills'); const skills = await res.json();
+        const grid = document.getElementById('skills-grid');
+        if (skills.length === 0) { grid.innerHTML = '<div class="skills-empty">No skills loaded.</div>'; skillsLoaded = true; return; }
+        grid.innerHTML = '';
+        for (const s of skills) {
+          const card = document.createElement('div'); card.className = 'skill-card';
+          const emoji = s.emoji || '&#128736;';
+          let badges = '<span class="badge badge-source">' + esc(s.source) + '</span><span class="badge badge-slug">/' + esc(s.slug) + '</span>';
+          if (s.user_invocable) badges += '<span class="badge badge-invocable">user-invocable</span>';
+          card.innerHTML = '<div class="skill-card-header"><span class="skill-emoji">' + emoji + '</span><span class="skill-name">' + esc(s.name) + '</span></div><div class="skill-desc">' + esc(s.description || 'No description') + '</div><div class="skill-badges">' + badges + '</div>';
+          grid.appendChild(card);
+        }
+        skillsLoaded = true;
+      } catch (e) { document.getElementById('skills-grid').innerHTML = '<div class="skills-empty">Failed to load skills.</div>'; }
+    }
+
+    // ── Config ──────────────────────────────────────────────────────────
+    let configLoaded = false;
+    async function loadConfig() {
+      if (configLoaded) return;
+      try {
+        const res = await fetch('/api/config'); const cfg = await res.json();
+        document.getElementById('cfg-provider').value = cfg.provider;
+        document.getElementById('cfg-model').value = cfg.model;
+        document.getElementById('cfg-auth-mode').value = cfg.auth_mode;
+        document.getElementById('cfg-max-iter').value = cfg.max_iterations;
+        configLoaded = true;
+      } catch (e) { showNotice('error', 'Failed to load config.'); }
+    }
+    async function saveConfig() {
+      const notice = document.getElementById('config-notice'); notice.className = 'config-notice'; notice.style.display = 'none';
+      try {
+        const body = { provider: document.getElementById('cfg-provider').value, model: document.getElementById('cfg-model').value, auth_mode: document.getElementById('cfg-auth-mode').value, max_iterations: parseInt(document.getElementById('cfg-max-iter').value, 10) };
+        const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const result = await res.json();
+        if (result.success) { showNotice(result.restart_required ? 'warning' : 'success', result.message); }
+        else { showNotice('error', result.message); }
+      } catch (e) { showNotice('error', 'Failed to save config.'); }
+    }
+    function showNotice(type, msg) { const el = document.getElementById('config-notice'); el.className = 'config-notice ' + type; el.textContent = msg; }
+    function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
   </script>
 </body>
-</html>"#;
+</html>"##;

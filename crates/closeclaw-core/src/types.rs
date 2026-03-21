@@ -100,6 +100,10 @@ pub enum Event {
         output: String,
         is_error: bool,
     },
+    TextDelta {
+        session_id: SessionId,
+        text: String,
+    },
     SessionCreated(SessionId),
     SessionReset(SessionId),
     Error {

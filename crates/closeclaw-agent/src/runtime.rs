@@ -236,7 +236,25 @@ impl Agent for AgentRuntime {
 
             debug!("ReAct iteration {iteration}, history len = {}", messages.len());
 
-            let response = self.llm.chat(&messages, &tool_defs).await?;
+            // Create a delta channel and forward text deltas as events
+            let (delta_tx, mut delta_rx) = mpsc::channel::<String>(256);
+            let delta_session_id = session.id.clone();
+            let delta_event_tx = event_tx.clone();
+            let delta_forwarder = tokio::spawn(async move {
+                while let Some(text) = delta_rx.recv().await {
+                    let _ = delta_event_tx
+                        .send(Event::TextDelta {
+                            session_id: delta_session_id.clone(),
+                            text,
+                        })
+                        .await;
+                }
+            });
+
+            let response = self.llm.chat_stream(&messages, &tool_defs, &delta_tx).await;
+            drop(delta_tx); // close channel so forwarder stops
+            let _ = delta_forwarder.await;
+            let response = response?;
 
             match response {
                 LlmResponse::Text(text) => {
