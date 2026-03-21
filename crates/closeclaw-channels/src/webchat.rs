@@ -602,7 +602,7 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
           <label>Auth Mode</label>
           <select id="cfg-auth-mode">
             <option value="api_key">API Key</option>
-            <option value="oauth_token">OAuth Token</option>
+            <option value="oauth_token">Claude Subscription (OAuth)</option>
           </select>
         </div>
         <div class="form-group">
