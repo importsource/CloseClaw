@@ -4,7 +4,7 @@ use axum::{
         State,
     },
     http::StatusCode,
-    response::{Html, Json},
+    response::{Html, IntoResponse, Json},
     routing::{get, post},
     Router,
 };
@@ -26,6 +26,7 @@ struct AppState {
     skills: Arc<Vec<Skill>>,
     config: Arc<RwLock<Config>>,
     config_path: Arc<PathBuf>,
+    workspace: Arc<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,6 +41,7 @@ pub async fn serve(
     skills: Vec<Skill>,
     config: Config,
     config_path: PathBuf,
+    workspace: PathBuf,
     bind: &str,
     port: u16,
 ) -> anyhow::Result<()> {
@@ -48,6 +50,7 @@ pub async fn serve(
         skills: Arc::new(skills),
         config: Arc::new(RwLock::new(config)),
         config_path: Arc::new(config_path),
+        workspace: Arc::new(workspace),
     };
     let app = Router::new()
         .route("/", get(index_handler))
@@ -55,6 +58,9 @@ pub async fn serve(
         .route("/api/skills", get(skills_handler))
         .route("/api/config", get(config_get_handler))
         .route("/api/config", post(config_post_handler))
+        .route("/favicon.ico", get(favicon_handler))
+        .route("/logo.png", get(logo_handler))
+        .route("/files/{*path}", get(file_handler))
         .with_state(state);
 
     let addr = format!("{bind}:{port}");
@@ -64,8 +70,63 @@ pub async fn serve(
     Ok(())
 }
 
-async fn index_handler() -> Html<&'static str> {
-    Html(CHAT_HTML)
+async fn index_handler(State(state): State<AppState>) -> Html<String> {
+    let workspace_str = state.workspace.display().to_string();
+    let html = CHAT_HTML.replace("__WORKSPACE__", &workspace_str);
+    Html(html)
+}
+
+async fn file_handler(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    // Resolve the path: expand ~ to home dir, or treat as absolute
+    let file_path = if path.starts_with("~/") || path == "~" {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join(path.strip_prefix("~/").unwrap_or(&path))
+    } else {
+        PathBuf::from(format!("/{path}"))
+    };
+
+    let canonical = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+
+    // Only serve image files for security
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let content_type = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => return (StatusCode::FORBIDDEN, "Only image files are served").into_response(),
+    };
+
+    let bytes = match std::fs::read(&canonical) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+
+    (
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn favicon_handler() -> impl axum::response::IntoResponse {
+    static FAVICON: &[u8] = include_bytes!("../../../favicon.ico");
+    ([(axum::http::header::CONTENT_TYPE, "image/x-icon")], FAVICON)
+}
+
+async fn logo_handler() -> impl axum::response::IntoResponse {
+    static LOGO: &[u8] = include_bytes!("../../../closeclaw-icon.png");
+    ([(axum::http::header::CONTENT_TYPE, "image/png")], LOGO)
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl axum::response::IntoResponse {
@@ -219,10 +280,18 @@ struct LlmConfigResponse {
     model: String,
     auth_mode: String,
     max_iterations: usize,
+    has_api_key: bool,
+    has_telegram_token: bool,
 }
 
 async fn config_get_handler(State(state): State<AppState>) -> Json<LlmConfigResponse> {
     let cfg = state.config.read().await;
+    let env_var = match cfg.llm.provider {
+        closeclaw_core::config::LlmProvider::Openai => "OPENAI_API_KEY",
+        _ => "ANTHROPIC_API_KEY",
+    };
+    let has_api_key = std::env::var(env_var).map(|v| !v.is_empty()).unwrap_or(false);
+    let has_telegram_token = std::env::var("TELOXIDE_TOKEN").map(|v| !v.is_empty()).unwrap_or(false);
     Json(LlmConfigResponse {
         provider: format!("{:?}", cfg.llm.provider).to_lowercase(),
         model: cfg.llm.model.clone(),
@@ -231,6 +300,8 @@ async fn config_get_handler(State(state): State<AppState>) -> Json<LlmConfigResp
             closeclaw_core::config::AuthMode::OauthToken => "oauth_token".to_string(),
         },
         max_iterations: cfg.llm.max_iterations,
+        has_api_key,
+        has_telegram_token,
     })
 }
 
@@ -240,6 +311,8 @@ struct LlmConfigUpdate {
     model: Option<String>,
     auth_mode: Option<String>,
     max_iterations: Option<usize>,
+    api_key: Option<String>,
+    telegram_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -302,6 +375,42 @@ async fn config_post_handler(
 
     if let Some(max_iter) = update.max_iterations {
         cfg.llm.max_iterations = max_iter;
+    }
+
+    // Save actual secrets to ~/.closeclaw/.env and set in process
+    let dotenv_dir = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(".")).join(".closeclaw");
+    let _ = std::fs::create_dir_all(&dotenv_dir);
+    let dotenv_path = dotenv_dir.join(".env");
+    // Read existing .env lines
+    let mut env_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(contents) = std::fs::read_to_string(&dotenv_path) {
+        for line in contents.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                env_map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    if let Some(ref api_key) = update.api_key {
+        if !api_key.is_empty() {
+            let env_var = match cfg.llm.provider {
+                closeclaw_core::config::LlmProvider::Openai => "OPENAI_API_KEY",
+                _ => "ANTHROPIC_API_KEY",
+            };
+            env_map.insert(env_var.to_string(), api_key.clone());
+            std::env::set_var(env_var, api_key);
+            restart_required = true;
+        }
+    }
+    if let Some(ref tg_token) = update.telegram_token {
+        if !tg_token.is_empty() {
+            env_map.insert("TELOXIDE_TOKEN".to_string(), tg_token.clone());
+            std::env::set_var("TELOXIDE_TOKEN", tg_token);
+            restart_required = true;
+        }
+    }
+    let env_lines: Vec<String> = env_map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    if !env_lines.is_empty() {
+        let _ = std::fs::write(&dotenv_path, env_lines.join("\n") + "\n");
     }
 
     match cfg.to_toml() {
@@ -434,7 +543,8 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
 
     /* ── Sidebar ──────────────────────────────────────────────────────── */
     .sidebar { width: 220px; background: var(--bg-sidebar); display: flex; flex-direction: column; border-right: 1px solid var(--border); flex-shrink: 0; transition: background 0.2s; }
-    .sidebar-logo { padding: 1.25rem 1rem; font-size: 1.25rem; font-weight: 700; color: var(--accent); border-bottom: 1px solid var(--border); letter-spacing: 0.5px; }
+    .sidebar-logo { padding: 1.25rem 1rem; font-size: 1.25rem; font-weight: 700; color: var(--accent); border-bottom: 1px solid var(--border); letter-spacing: 0.5px; display: flex; align-items: center; gap: 0.6rem; }
+    .sidebar-logo img { width: 32px; height: 32px; border-radius: 6px; }
     .sidebar-nav { flex: 1; padding: 0.75rem 0; }
     .nav-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.7rem 1rem; cursor: pointer; color: var(--text-secondary); transition: all 0.15s; border-left: 3px solid transparent; font-size: 0.95rem; }
     .nav-item:hover { background: var(--bg-card); color: var(--text-primary); }
@@ -506,6 +616,11 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
     @keyframes spin { to { transform: rotate(360deg); } }
     .tool-done { color: var(--tool-done-text); background: var(--tool-done-bg); }
 
+    /* ── Lightbox ─────────────────────────────────────────────────────── */
+    .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 1000; cursor: pointer; }
+    .lightbox img { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
+    .msg img { cursor: pointer; }
+
     /* ── Skills ────────────────────────────────────────────────────────── */
     .skills-page { padding: 1.5rem; overflow-y: auto; }
     .skills-header { font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem; }
@@ -541,7 +656,7 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
 </head>
 <body>
   <div class="sidebar">
-    <div class="sidebar-logo">CloseClaw</div>
+    <div class="sidebar-logo"><img src="/logo.png" alt="CloseClaw" />CloseClaw</div>
     <nav class="sidebar-nav">
       <div class="nav-item active" data-page="chat">
         <span class="nav-icon">&#128172;</span> Chat
@@ -596,18 +711,24 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
         </div>
         <div class="form-group">
           <label>Model</label>
-          <input id="cfg-model" type="text" placeholder="claude-sonnet-4-20250514" />
+          <select id="cfg-model"></select>
         </div>
         <div class="form-group">
           <label>Auth Mode</label>
-          <select id="cfg-auth-mode">
-            <option value="api_key">API Key</option>
-            <option value="oauth_token">Claude Subscription (OAuth)</option>
-          </select>
+          <select id="cfg-auth-mode"></select>
+        </div>
+        <div class="form-group" id="fg-api-key" style="display:none;">
+          <label>API Key <span id="api-key-status" style="font-size:0.8em;"></span></label>
+          <input id="cfg-api-key" type="password" placeholder="Enter your API key" autocomplete="off" />
         </div>
         <div class="form-group">
           <label>Max Iterations</label>
           <input id="cfg-max-iter" type="number" min="1" max="100" />
+        </div>
+        <div class="config-header" style="margin-top:1.5rem;">Telegram Configuration</div>
+        <div class="form-group">
+          <label>Bot Token <span id="tg-token-status" style="font-size:0.8em;"></span></label>
+          <input id="cfg-tg-token" type="password" placeholder="Enter your Telegram bot token" autocomplete="off" />
         </div>
         <button class="config-save-btn" onclick="saveConfig()">Save Config</button>
         <div id="config-notice" class="config-notice"></div>
@@ -637,6 +758,9 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
       applyTheme(getTheme() === 'dark' ? 'light' : 'dark');
     });
 
+    // ── Workspace path (injected by server) ──────────────────────────
+    const WORKSPACE = '__WORKSPACE__';
+
     // ── Markdown setup ──────────────────────────────────────────────────
     marked.setOptions({
       highlight: function(code, lang) {
@@ -648,7 +772,62 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
       breaks: true,
       gfm: true,
     });
-    function renderMarkdown(text) { return marked.parse(text); }
+    function toFilesUrl(path) {
+      // Convert an absolute or ~/ image path to a /files/ URL
+      if (path.startsWith('/files/')) return null; // already rewritten
+      if (path.startsWith('~/')) return '/files/' + path;
+      if (path.startsWith('/')) return '/files' + path;
+      return null;
+    }
+    const IMG_EXT = /\.(?:png|jpe?g|gif|webp|svg)$/i;
+
+    function renderMarkdown(text) {
+      // Pre-process: convert bare image paths (absolute or ~/...) to markdown images
+      text = text.replace(
+        /(^|[\s(>])((?:~\/|\/)([\w.\-]+\/)*[\w.\-]+\.(?:png|jpe?g|gif|webp|svg))\b/gim,
+        (match, prefix, path) => {
+          const url = toFilesUrl(path);
+          if (url) {
+            const name = path.split('/').pop();
+            return prefix + '![' + name + '](' + url + ')';
+          }
+          return match;
+        }
+      );
+      let html = marked.parse(text);
+      // Post-process: rewrite <img src="..."> with absolute/~ paths
+      html = html.replace(
+        /(<img\s[^>]*src=")((?:~\/|\/)[^"]*\.(?:png|jpe?g|gif|webp|svg))(")/gi,
+        (match, pre, src, post) => {
+          const url = toFilesUrl(src);
+          return url ? pre + url + post : match;
+        }
+      );
+      // Post-process: convert <code>/path/to/image.ext</code> into inline <img>
+      html = html.replace(
+        /<code>((?:~\/|\/)[^<]*\.(?:png|jpe?g|gif|webp|svg))<\/code>/gi,
+        (match, path) => {
+          const url = toFilesUrl(path);
+          if (url) {
+            const name = path.split('/').pop();
+            return '<img src="' + url + '" alt="' + name + '" />';
+          }
+          return match;
+        }
+      );
+      return html;
+    }
+
+    // ── Lightbox ─────────────────────────────────────────────────────────
+    document.addEventListener('click', e => {
+      if (e.target.matches('.msg img')) {
+        const lb = document.createElement('div');
+        lb.className = 'lightbox';
+        lb.innerHTML = '<img src="' + e.target.src + '">';
+        lb.onclick = () => lb.remove();
+        document.body.appendChild(lb);
+      }
+    });
 
     // ── Navigation ──────────────────────────────────────────────────────
     const navItems = document.querySelectorAll('.nav-item');
@@ -778,28 +957,113 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
     }
 
     // ── Config ──────────────────────────────────────────────────────────
+    const MODELS = {
+      anthropic: [
+        { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4' },
+        { value: 'claude-opus-4-20250514', label: 'Claude Opus 4' },
+        { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' },
+      ],
+      openai: [
+        { value: 'gpt-4o', label: 'GPT-4o' },
+        { value: 'gpt-4o-mini', label: 'GPT-4o Mini' },
+        { value: 'gpt-4-turbo', label: 'GPT-4 Turbo' },
+      ]
+    };
+    const AUTH_MODES = {
+      anthropic: [
+        { value: 'api_key', label: 'API Key' },
+        { value: 'oauth_token', label: 'OAuth Token (Claude Subscription)' },
+      ],
+      openai: [
+        { value: 'api_key', label: 'API Key' },
+      ]
+    };
+
     let configLoaded = false;
+
+    function populateModels(provider, currentModel) {
+      const sel = document.getElementById('cfg-model');
+      sel.innerHTML = '';
+      (MODELS[provider] || []).forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.value; opt.textContent = m.label;
+        sel.appendChild(opt);
+      });
+      if (currentModel) sel.value = currentModel;
+    }
+
+    function populateAuthModes(provider, currentMode) {
+      const sel = document.getElementById('cfg-auth-mode');
+      sel.innerHTML = '';
+      (AUTH_MODES[provider] || []).forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.value; opt.textContent = m.label;
+        sel.appendChild(opt);
+      });
+      if (currentMode) sel.value = currentMode;
+      toggleAuthFields();
+    }
+
+    function toggleAuthFields() {
+      const mode = document.getElementById('cfg-auth-mode').value;
+      document.getElementById('fg-api-key').style.display = mode === 'api_key' ? '' : 'none';
+    }
+
+    document.getElementById('cfg-provider').addEventListener('change', () => {
+      const provider = document.getElementById('cfg-provider').value;
+      populateModels(provider);
+      populateAuthModes(provider);
+    });
+    document.getElementById('cfg-auth-mode').addEventListener('change', toggleAuthFields);
+
     async function loadConfig() {
       if (configLoaded) return;
       try {
         const res = await fetch('/api/config'); const cfg = await res.json();
         document.getElementById('cfg-provider').value = cfg.provider;
-        document.getElementById('cfg-model').value = cfg.model;
-        document.getElementById('cfg-auth-mode').value = cfg.auth_mode;
+        populateModels(cfg.provider, cfg.model);
+        populateAuthModes(cfg.provider, cfg.auth_mode);
         document.getElementById('cfg-max-iter').value = cfg.max_iterations;
+        if (cfg.has_api_key) {
+          document.getElementById('api-key-status').textContent = '(configured)';
+          document.getElementById('api-key-status').style.color = 'var(--tool-done-text)';
+          document.getElementById('cfg-api-key').placeholder = '••••••••  (leave blank to keep current)';
+        }
+        if (cfg.has_telegram_token) {
+          document.getElementById('tg-token-status').textContent = '(configured)';
+          document.getElementById('tg-token-status').style.color = 'var(--tool-done-text)';
+          document.getElementById('cfg-tg-token').placeholder = '••••••••  (leave blank to keep current)';
+        }
         configLoaded = true;
       } catch (e) { showNotice('error', 'Failed to load config.'); }
     }
+
     async function saveConfig() {
-      const notice = document.getElementById('config-notice'); notice.className = 'config-notice'; notice.style.display = 'none';
+      const notice = document.getElementById('config-notice'); notice.className = 'config-notice'; notice.textContent = '';
       try {
-        const body = { provider: document.getElementById('cfg-provider').value, model: document.getElementById('cfg-model').value, auth_mode: document.getElementById('cfg-auth-mode').value, max_iterations: parseInt(document.getElementById('cfg-max-iter').value, 10) };
+        const body = {
+          provider: document.getElementById('cfg-provider').value,
+          model: document.getElementById('cfg-model').value,
+          auth_mode: document.getElementById('cfg-auth-mode').value,
+          max_iterations: parseInt(document.getElementById('cfg-max-iter').value, 10),
+        };
+        const apiKey = document.getElementById('cfg-api-key').value;
+        const tgToken = document.getElementById('cfg-tg-token').value;
+        if (apiKey) body.api_key = apiKey;
+        if (tgToken) body.telegram_token = tgToken;
         const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const result = await res.json();
-        if (result.success) { showNotice(result.restart_required ? 'warning' : 'success', result.message); }
-        else { showNotice('error', result.message); }
+        if (result.success) {
+          showNotice(result.restart_required ? 'warning' : 'success', result.message);
+          // Clear password fields and reload status
+          document.getElementById('cfg-api-key').value = '';
+          document.getElementById('cfg-tg-token').value = '';
+          configLoaded = false;
+          loadConfig();
+        } else { showNotice('error', result.message); }
       } catch (e) { showNotice('error', 'Failed to save config.'); }
     }
+
     function showNotice(type, msg) { const el = document.getElementById('config-notice'); el.className = 'config-notice ' + type; el.textContent = msg; }
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
   </script>

@@ -416,9 +416,10 @@ async fn run_gateway(config: Config, workspace: PathBuf, config_path: PathBuf) -
     let wc_skills = skills;
     let wc_config = config.clone();
     let wc_config_path = config_path;
+    let wc_workspace = workspace.clone();
     handles.push(tokio::spawn(async move {
         if let Err(e) = closeclaw_channels::webchat::serve(
-            hub_wc, wc_skills, wc_config, wc_config_path, &bind, port,
+            hub_wc, wc_skills, wc_config, wc_config_path, wc_workspace, &bind, port,
         ).await {
             error!("WebChat error: {e}");
         }
