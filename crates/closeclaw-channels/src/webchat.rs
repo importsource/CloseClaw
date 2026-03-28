@@ -15,6 +15,7 @@ use closeclaw_core::types::{
 };
 use closeclaw_gateway::hub::Hub;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -134,116 +135,203 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
-    let session_id = SessionId(uuid::Uuid::new_v4().to_string());
+    let own_sid = SessionId(uuid::Uuid::new_v4().to_string());
     let channel_id = ChannelId("webchat".to_string());
     let user_id = uuid::Uuid::new_v4().to_string();
 
-    info!("WebSocket connected: session {session_id}");
+    info!("WebSocket connected: session {own_sid}");
 
-    while let Some(Ok(ws_msg)) = socket.recv().await {
-        let text = match ws_msg {
-            WsMessage::Text(t) => t.to_string(),
-            WsMessage::Close(_) => break,
-            _ => continue,
-        };
+    // Subscribe once at connection start so we never miss cross-channel events
+    let mut event_rx = state.hub.subscribe_events();
 
-        let chat_msg: ChatMsg = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+    // Track foreign sessions we are actively relaying
+    let mut tracked_foreign: HashSet<SessionId> = HashSet::new();
 
-        if chat_msg.msg_type != "message" {
-            continue;
-        }
+    // Optional oneshot for the own-session response currently in flight
+    let mut own_result_rx: Option<tokio::sync::oneshot::Receiver<closeclaw_core::error::Result<String>>> = None;
 
-        // Send typing indicator immediately
-        let _ = socket
-            .send(WsMessage::Text(r#"{"type":"typing"}"#.into()))
-            .await;
+    loop {
+        tokio::select! {
+            // ── Branch 1: incoming WebSocket message from browser ────────
+            ws_frame = socket.recv() => {
+                let ws_msg = match ws_frame {
+                    Some(Ok(m)) => m,
+                    _ => break, // disconnected or error
+                };
 
-        let msg = Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id: session_id.clone(),
-            channel_id: channel_id.clone(),
-            sender: Sender::User {
-                name: "WebUser".to_string(),
-                id: user_id.clone(),
-            },
-            content: MessageContent::Text(chat_msg.content),
-            timestamp: chrono::Utc::now(),
-        };
+                let text = match ws_msg {
+                    WsMessage::Text(t) => t.to_string(),
+                    WsMessage::Close(_) => break,
+                    _ => continue,
+                };
 
-        // Subscribe to events before processing, so we don't miss any
-        let mut event_rx = state.hub.subscribe_events();
-        let sid = session_id.clone();
+                let chat_msg: ChatMsg = match serde_json::from_str(&text) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
 
-        // Spawn hub processing in background
-        let hub = state.hub.clone();
-        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = hub.handle_message(msg).await;
-            let _ = result_tx.send(result);
-        });
-
-        // Forward events in real-time until result arrives
-        loop {
-            tokio::select! {
-                event = event_rx.recv() => {
-                    if let Ok(event) = event {
-                        match &event {
-                            Event::TextDelta { session_id: s, text } if *s == sid => {
-                                let json = serde_json::json!({
-                                    "type": "text_delta",
-                                    "content": text,
-                                });
-                                if socket.send(WsMessage::Text(json.to_string().into())).await.is_err() {
-                                    return; // client disconnected
-                                }
-                            }
-                            Event::ToolInvoked { session_id: s, tool, .. } if *s == sid => {
-                                let json = serde_json::json!({
-                                    "type": "tool_invoked",
-                                    "tool": tool,
-                                });
-                                let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
-                            }
-                            Event::ToolResult { session_id: s, tool, is_error, .. } if *s == sid => {
-                                let json = serde_json::json!({
-                                    "type": "tool_result",
-                                    "tool": tool,
-                                    "is_error": is_error,
-                                });
-                                let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
-                            }
-                            _ => {}
-                        }
-                    }
+                if chat_msg.msg_type != "message" {
+                    continue;
                 }
-                result = &mut result_rx => {
-                    let response = match result {
-                        Ok(Ok(r)) => r,
-                        Ok(Err(e)) => {
-                            error!("Agent error: {e}");
-                            format!("Error: {e}")
-                        }
-                        Err(_) => "Internal error".to_string(),
-                    };
-                    let reply = ChatMsg {
-                        msg_type: "response".to_string(),
-                        content: response,
-                    };
-                    if let Ok(json) = serde_json::to_string(&reply) {
-                        if socket.send(WsMessage::Text(json.into())).await.is_err() {
+
+                // Send typing indicator immediately
+                let _ = socket
+                    .send(WsMessage::Text(r#"{"type":"typing"}"#.into()))
+                    .await;
+
+                let msg = Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    session_id: own_sid.clone(),
+                    channel_id: channel_id.clone(),
+                    sender: Sender::User {
+                        name: "WebUser".to_string(),
+                        id: user_id.clone(),
+                    },
+                    content: MessageContent::Text(chat_msg.content),
+                    timestamp: chrono::Utc::now(),
+                };
+
+                // Spawn hub processing in background
+                let hub = state.hub.clone();
+                let (result_tx, rx) = tokio::sync::oneshot::channel();
+                own_result_rx = Some(rx);
+                tokio::spawn(async move {
+                    let result = hub.handle_message(msg).await;
+                    let _ = result_tx.send(result);
+                });
+            }
+
+            // ── Branch 2: EventBus events (own + cross-channel) ──────────
+            event = event_rx.recv() => {
+                let event = match event {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                match &event {
+                    // --- Own-session events ---------------------------------
+                    Event::TextDelta { session_id, text } if *session_id == own_sid => {
+                        let json = serde_json::json!({
+                            "type": "text_delta",
+                            "content": text,
+                        });
+                        if socket.send(WsMessage::Text(json.to_string().into())).await.is_err() {
                             return;
                         }
                     }
-                    break;
+                    Event::ToolInvoked { session_id, tool, .. } if *session_id == own_sid => {
+                        let json = serde_json::json!({
+                            "type": "tool_invoked",
+                            "tool": tool,
+                        });
+                        let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                    }
+                    Event::ToolResult { session_id, tool, is_error, .. } if *session_id == own_sid => {
+                        let json = serde_json::json!({
+                            "type": "tool_result",
+                            "tool": tool,
+                            "is_error": is_error,
+                        });
+                        let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                    }
+
+                    // --- Cross-channel: new message from another channel ---
+                    Event::MessageReceived(msg) if msg.session_id != own_sid && msg.channel_id.0 != "webchat" => {
+                        tracked_foreign.insert(msg.session_id.clone());
+                        let sender_name = match &msg.sender {
+                            Sender::User { name, .. } => name.clone(),
+                            Sender::Agent { agent_id } => agent_id.0.clone(),
+                        };
+                        let text = match &msg.content {
+                            MessageContent::Text(t) => t.clone(),
+                            _ => continue,
+                        };
+                        let json = serde_json::json!({
+                            "type": "cross_channel_message",
+                            "sessionId": msg.session_id.0,
+                            "channel": msg.channel_id.0,
+                            "sender": sender_name,
+                            "content": text,
+                        });
+                        let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                    }
+
+                    // --- Cross-channel: streaming text delta ---------------
+                    Event::TextDelta { session_id, text } if tracked_foreign.contains(session_id) => {
+                        let json = serde_json::json!({
+                            "type": "cross_channel_text_delta",
+                            "sessionId": session_id.0,
+                            "content": text,
+                        });
+                        let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                    }
+
+                    // --- Cross-channel: tool invoked -----------------------
+                    Event::ToolInvoked { session_id, tool, .. } if tracked_foreign.contains(session_id) => {
+                        let json = serde_json::json!({
+                            "type": "cross_channel_tool_invoked",
+                            "sessionId": session_id.0,
+                            "tool": tool,
+                        });
+                        let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                    }
+
+                    // --- Cross-channel: tool result ------------------------
+                    Event::ToolResult { session_id, tool, is_error, .. } if tracked_foreign.contains(session_id) => {
+                        let json = serde_json::json!({
+                            "type": "cross_channel_tool_result",
+                            "sessionId": session_id.0,
+                            "tool": tool,
+                            "is_error": is_error,
+                        });
+                        let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                    }
+
+                    // --- Cross-channel: agent response (done) --------------
+                    Event::AgentResponse { session_id, content } if tracked_foreign.contains(session_id) => {
+                        let json = serde_json::json!({
+                            "type": "cross_channel_response",
+                            "sessionId": session_id.0,
+                            "content": content,
+                        });
+                        let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                        tracked_foreign.remove(session_id);
+                    }
+
+                    _ => {}
+                }
+            }
+
+            // ── Branch 3: own-session result ready ───────────────────────
+            result = async {
+                match own_result_rx.as_mut() {
+                    Some(rx) => rx.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                own_result_rx = None;
+                let response = match result {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        error!("Agent error: {e}");
+                        format!("Error: {e}")
+                    }
+                    Err(_) => "Internal error".to_string(),
+                };
+                let reply = ChatMsg {
+                    msg_type: "response".to_string(),
+                    content: response,
+                };
+                if let Ok(json) = serde_json::to_string(&reply) {
+                    if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                        return;
+                    }
                 }
             }
         }
     }
 
-    info!("WebSocket disconnected: session {session_id}");
+    info!("WebSocket disconnected: session {own_sid}");
 }
 
 // ── API handlers ────────────────────────────────────────────────────────
@@ -616,6 +704,19 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
     @keyframes spin { to { transform: rotate(360deg); } }
     .tool-done { color: var(--tool-done-text); background: var(--tool-done-bg); }
 
+    /* ── Cross-channel messages ──────────────────────────────────────── */
+    .msg.cross-user { background: #0f3d2e; margin-left: 0; opacity: 0.92; }
+    [data-theme="light"] .msg.cross-user { background: #d1fae5; }
+    .msg.cross-agent { background: var(--msg-agent); border: 1px solid #2d6a4f; opacity: 0.92; }
+    [data-theme="light"] .msg.cross-agent { border-color: #86efac; }
+    .channel-badge { display: inline-block; font-size: 0.6rem; padding: 0.1rem 0.4rem; border-radius: 3px; background: #065f46; color: #6ee7b7; margin-left: 0.4rem; vertical-align: middle; text-transform: lowercase; font-weight: 600; letter-spacing: 0.3px; }
+    [data-theme="light"] .channel-badge { background: #dcfce7; color: #15803d; }
+    .cross-tool-activity { font-size: 0.8rem; color: #6ee7b7; background: #064e3b; border-radius: 6px; padding: 0.4rem 0.75rem; margin-bottom: 0.5rem; max-width: 85%; display: flex; align-items: center; gap: 0.5rem; opacity: 0.92; }
+    [data-theme="light"] .cross-tool-activity { color: #15803d; background: #dcfce7; }
+    .cross-tool-activity .spinner { width: 12px; height: 12px; border: 2px solid #6ee7b7; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
+    [data-theme="light"] .cross-tool-activity .spinner { border-color: #15803d; border-top-color: transparent; }
+    .cross-tool-activity.tool-done { color: var(--tool-done-text); background: var(--tool-done-bg); }
+
     /* ── Lightbox ─────────────────────────────────────────────────────── */
     .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 1000; cursor: pointer; }
     .lightbox img { max-width: 95vw; max-height: 95vh; border-radius: 8px; }
@@ -851,6 +952,8 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
     const typingIndicator = document.getElementById('typing-indicator');
     const typingLabel = document.getElementById('typing-label');
     let ws, reconnectTimer, isProcessing = false, streamingMsgEl = null;
+    // Track cross-channel streaming elements keyed by sessionId
+    const crossStreamEls = {};
 
     function connectWs() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -866,6 +969,11 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
           case 'tool_invoked': showToolActivity(data.tool); break;
           case 'tool_result': markToolDone(data.tool, data.is_error); break;
           case 'response': finishResponse(data.content); break;
+          case 'cross_channel_message': addCrossChannelMsg(data); break;
+          case 'cross_channel_text_delta': appendCrossChannelStreamDelta(data); break;
+          case 'cross_channel_tool_invoked': showCrossChannelToolActivity(data); break;
+          case 'cross_channel_tool_result': markCrossChannelToolDone(data); break;
+          case 'cross_channel_response': finishCrossChannelResponse(data); break;
         }
       };
     }
@@ -899,6 +1007,58 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
       scrollToBottom();
     }
     function finalizeStreamingMsg() { streamingMsgEl = null; }
+
+    // ── Cross-channel functions ──────────────────────────────────────────
+    function addCrossChannelMsg(data) {
+      const d = document.createElement('div'); d.className = 'msg cross-user';
+      d.innerHTML = '<div class="label">' + esc(data.sender) + '<span class="channel-badge">' + esc(data.channel) + '</span></div><div class="text"></div>';
+      d.querySelector('.text').textContent = data.content;
+      messagesEl.insertBefore(d, typingIndicator); scrollToBottom();
+    }
+
+    function appendCrossChannelStreamDelta(data) {
+      const sid = data.sessionId;
+      if (!crossStreamEls[sid]) {
+        const d = document.createElement('div'); d.className = 'msg cross-agent agent';
+        d.innerHTML = '<div class="label">agent<span class="channel-badge">cross-channel</span></div><div class="text streaming"></div>';
+        messagesEl.insertBefore(d, typingIndicator);
+        crossStreamEls[sid] = d;
+      }
+      crossStreamEls[sid].querySelector('.text').textContent += data.content;
+      scrollToBottom();
+    }
+
+    function showCrossChannelToolActivity(data) {
+      // Finalize any in-progress cross-channel streaming for this session
+      if (crossStreamEls[data.sessionId]) {
+        crossStreamEls[data.sessionId] = null;
+      }
+      const el = document.createElement('div');
+      el.className = 'cross-tool-activity'; el.dataset.tool = data.tool; el.dataset.sid = data.sessionId;
+      el.innerHTML = '<div class="spinner"></div> [' + esc(data.sessionId.slice(0,8)) + '] Using ' + esc(data.tool) + '...';
+      messagesEl.insertBefore(el, typingIndicator); scrollToBottom();
+    }
+
+    function markCrossChannelToolDone(data) {
+      const els = messagesEl.querySelectorAll('.cross-tool-activity[data-tool="' + data.tool + '"][data-sid="' + data.sessionId + '"]');
+      const el = els[els.length - 1];
+      if (el) { el.classList.add('tool-done'); el.innerHTML = (data.is_error ? '&#10060; ' : '&#10003; ') + '[' + esc(data.sessionId.slice(0,8)) + '] ' + esc(data.tool) + ' done'; }
+    }
+
+    function finishCrossChannelResponse(data) {
+      const sid = data.sessionId;
+      if (crossStreamEls[sid]) {
+        const t = crossStreamEls[sid].querySelector('.text');
+        t.classList.remove('streaming'); t.innerHTML = renderMarkdown(data.content);
+        delete crossStreamEls[sid];
+      } else {
+        const d = document.createElement('div'); d.className = 'msg cross-agent agent';
+        d.innerHTML = '<div class="label">agent<span class="channel-badge">cross-channel</span></div><div class="text"></div>';
+        d.querySelector('.text').innerHTML = renderMarkdown(data.content);
+        messagesEl.insertBefore(d, typingIndicator);
+      }
+      scrollToBottom();
+    }
 
     function finishResponse(fullText) {
       hideTyping();

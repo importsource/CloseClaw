@@ -74,6 +74,16 @@ impl Hub {
             _ => return Err(CloseClawError::Channel("Only text messages are supported".into())),
         };
 
+        // Broadcast so WebChat (and other listeners) see every incoming message
+        self.event_bus.publish(Event::MessageReceived(Message {
+            id: msg.id.clone(),
+            session_id: session_id.clone(),
+            channel_id: msg.channel_id.clone(),
+            sender: msg.sender.clone(),
+            content: MessageContent::Text(user_text.clone()),
+            timestamp: msg.timestamp,
+        }));
+
         let agent = self
             .agents
             .get(&agent_id)
