@@ -462,6 +462,20 @@ async fn run_gateway(config: Config, workspace: PathBuf, config_path: PathBuf) -
         scheduler.run(hub_sched, shutdown_rx).await;
     }));
 
+    // If we just restarted, notify connected clients after a short delay
+    let restart_marker = closeclaw_tools::self_manage::restart_marker_path();
+    if restart_marker.exists() {
+        let _ = std::fs::remove_file(&restart_marker);
+        let bus = hub.event_sender();
+        tokio::spawn(async move {
+            // Wait for WebChat clients to reconnect before broadcasting
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = bus.send(closeclaw_core::types::Event::SystemNotice {
+                message: "Server has restarted successfully.".to_string(),
+            });
+        });
+    }
+
     // Wait for any channel to finish (typically they run forever)
     for handle in handles {
         handle.await.ok();

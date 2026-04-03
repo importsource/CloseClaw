@@ -298,6 +298,15 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                         tracked_foreign.remove(session_id);
                     }
 
+                    // --- System-wide notices (e.g. post-restart) -----------
+                    Event::SystemNotice { message } => {
+                        let json = serde_json::json!({
+                            "type": "system_notice",
+                            "content": message,
+                        });
+                        let _ = socket.send(WsMessage::Text(json.to_string().into())).await;
+                    }
+
                     _ => {}
                 }
             }
@@ -698,6 +707,9 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
     .typing-label { font-size: 0.7rem; color: var(--text-muted); margin-top: 0.3rem; }
     @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-6px); } }
 
+    /* ── System notice ────────────────────────────────────────────────── */
+    .system-notice { font-size: 0.8rem; color: #a3cfbb; background: rgba(25, 135, 84, 0.15); border: 1px solid rgba(25, 135, 84, 0.3); border-radius: 6px; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; text-align: center; max-width: 85%; align-self: center; margin-left: auto; margin-right: auto; }
+
     /* ── Tool activity ────────────────────────────────────────────────── */
     .tool-activity { font-size: 0.8rem; color: var(--tool-text); background: var(--tool-bg); border-radius: 6px; padding: 0.4rem 0.75rem; margin-bottom: 0.5rem; max-width: 85%; display: flex; align-items: center; gap: 0.5rem; }
     .tool-activity .spinner { width: 12px; height: 12px; border: 2px solid var(--tool-text); border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; }
@@ -974,6 +986,7 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
           case 'cross_channel_tool_invoked': showCrossChannelToolActivity(data); break;
           case 'cross_channel_tool_result': markCrossChannelToolDone(data); break;
           case 'cross_channel_response': finishCrossChannelResponse(data); break;
+          case 'system_notice': addSystemNotice(data.content); break;
         }
       };
     }
@@ -1068,6 +1081,12 @@ const CHAT_HTML: &str = r##"<!DOCTYPE html>
         finalizeStreamingMsg();
       } else { addAgentMsg(fullText); }
       isProcessing = false; sendBtn.disabled = false; inputEl.disabled = false; inputEl.focus(); scrollToBottom();
+    }
+
+    function addSystemNotice(text) {
+      const d = document.createElement('div'); d.className = 'msg system-notice';
+      d.innerHTML = '<div class="text">' + esc(text) + '</div>';
+      messagesEl.insertBefore(d, typingIndicator); scrollToBottom();
     }
 
     function addAgentMsg(text) {

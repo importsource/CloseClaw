@@ -110,6 +110,9 @@ pub enum Event {
         session_id: Option<SessionId>,
         error: String,
     },
+    SystemNotice {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

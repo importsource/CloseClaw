@@ -1,8 +1,10 @@
 pub mod browser;
+pub mod browser_cdp;
 pub mod exec;
 pub mod read_file;
 pub mod sandbox;
 pub mod schedule;
+pub mod self_manage;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
@@ -25,6 +27,8 @@ pub fn builtin_tools(workspace: &Path) -> Vec<Arc<dyn Tool>> {
         Arc::new(sandbox::DeleteFileTool::new(workspace.to_path_buf())),
         Arc::new(sandbox::SearchFilesTool::new(workspace.to_path_buf())),
         Arc::new(browser::BrowserTool::new(workspace.to_path_buf())),
+        Arc::new(browser_cdp::BrowserCdpTool::new(workspace.to_path_buf())),
+        Arc::new(self_manage::SelfManageTool),
     ]
 }
 
