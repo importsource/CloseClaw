@@ -1,3 +1,6 @@
+workspace = "."
+schedules = []
+
 [gateway]
 bind = "127.0.0.1"
 port = 3000
@@ -5,7 +8,18 @@ port = 3000
 [[agents]]
 id = "default"
 name = "CloseClaw Agent"
-tools = ["exec", "read_file", "write_file", "web_fetch", "web_search", "list_files", "create_file", "delete_file", "search_files", "browser"]
+tools = [
+    "exec",
+    "read_file",
+    "write_file",
+    "web_fetch",
+    "web_search",
+    "list_files",
+    "create_file",
+    "delete_file",
+    "search_files",
+    "browser",
+]
 
 [[channels]]
 type = "webchat"
@@ -20,4 +34,4 @@ token_env = "TELOXIDE_TOKEN"
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
 auth_mode = "oauth_token"
-max_iterations = 100
+max_iterations = 20

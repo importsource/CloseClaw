@@ -149,12 +149,18 @@ impl AnthropicProvider {
                     output,
                     is_error,
                 } => {
+                    // Anthropic API requires non-empty content when is_error is true
+                    let content = if *is_error && output.is_empty() {
+                        "Error (no details provided)"
+                    } else {
+                        output
+                    };
                     api_msgs.push(serde_json::json!({
                         "role": "user",
                         "content": [{
                             "type": "tool_result",
                             "tool_use_id": id,
-                            "content": output,
+                            "content": content,
                             "is_error": is_error,
                         }],
                     }));
