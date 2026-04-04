@@ -1,4 +1,4 @@
-use closeclaw_core::types::{ChannelId, Message, MessageContent, Sender};
+use closeclaw_core::types::{ChannelId, Event, Message, MessageContent, Sender, SessionId};
 use closeclaw_gateway::hub::Hub;
 use regex::Regex;
 use std::path::PathBuf;
@@ -73,14 +73,10 @@ impl TelegramChannel {
                     .and_then(|u| u.username.clone())
                     .unwrap_or_else(|| "TelegramUser".to_string());
 
-                // Send typing indicator while the agent processes
-                let _ = bot
-                    .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-                    .await;
-
+                let msg_id = uuid::Uuid::new_v4().to_string();
                 let msg = Message {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    session_id: closeclaw_core::types::SessionId(String::new()), // Hub router will assign
+                    id: msg_id.clone(),
+                    session_id: SessionId(String::new()), // Hub router will assign
                     channel_id,
                     sender: Sender::User {
                         name: user_name,
@@ -90,28 +86,174 @@ impl TelegramChannel {
                     timestamp: chrono::Utc::now(),
                 };
 
-                let response = match hub.handle_message(msg).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("Agent error for chat {chat_id}: {e}");
-                        format!("Error: {e}")
+                // Subscribe to events before spawning so we don't miss any
+                let mut event_rx = hub.subscribe_events();
+
+                // Spawn handle_message in background with oneshot for the final result
+                let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
+                let hub_bg = hub.clone();
+                tokio::spawn(async move {
+                    let result = hub_bg.handle_message(msg).await;
+                    let _ = result_tx.send(result);
+                });
+
+                // Send typing indicator while the agent starts processing
+                let _ = bot
+                    .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                    .await;
+
+                // Streaming state
+                let mut session_id: Option<SessionId> = None;
+                let mut accumulated_text = String::new();
+                let mut tool_lines: Vec<String> = Vec::new();
+                let mut telegram_msg_id: Option<teloxide::types::MessageId> = None;
+                let mut last_sent_len: usize = 0;
+                let mut edit_interval =
+                    tokio::time::interval(std::time::Duration::from_secs(2));
+                edit_interval.tick().await; // consume the immediate first tick
+
+                loop {
+                    tokio::select! {
+                        event = event_rx.recv() => {
+                            let event = match event {
+                                Ok(e) => e,
+                                Err(_) => continue,
+                            };
+                            match &event {
+                                Event::MessageReceived(m) if m.id == msg_id => {
+                                    session_id = Some(m.session_id.clone());
+                                }
+                                Event::TextDelta { session_id: sid, text: delta }
+                                    if session_id.as_ref() == Some(sid) =>
+                                {
+                                    accumulated_text.push_str(delta);
+                                }
+                                Event::ToolInvoked { session_id: sid, tool, .. }
+                                    if session_id.as_ref() == Some(sid) =>
+                                {
+                                    tool_lines.push(format!("\n🔧 Using {}...", tool));
+                                }
+                                Event::ToolResult { session_id: sid, tool, .. }
+                                    if session_id.as_ref() == Some(sid) =>
+                                {
+                                    if let Some(line) = tool_lines.iter_mut().find(
+                                        |l| l.contains(&format!("Using {}...", tool)),
+                                    ) {
+                                        *line = format!("\n✓ {} done", tool);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        _ = edit_interval.tick() => {
+                            let mut display = accumulated_text.clone();
+                            for line in &tool_lines {
+                                display.push_str(line);
+                            }
+
+                            if display.len() > last_sent_len
+                                && !display.trim().is_empty()
+                            {
+                                let display_text = if display.len() > TELEGRAM_MAX_LEN {
+                                    &display[..TELEGRAM_MAX_LEN]
+                                } else {
+                                    display.as_str()
+                                };
+
+                                match telegram_msg_id {
+                                    None => {
+                                        match bot.send_message(chat_id, display_text).await {
+                                            Ok(sent) => {
+                                                telegram_msg_id = Some(sent.id);
+                                                last_sent_len = display.len();
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to send streaming message: {e}");
+                                            }
+                                        }
+                                    }
+                                    Some(mid) => {
+                                        match bot
+                                            .edit_message_text(chat_id, mid, display_text)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                last_sent_len = display.len();
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to edit streaming message: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        result = &mut result_rx => {
+                            let response = match result {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => {
+                                    error!("Agent error for chat {chat_id}: {e}");
+                                    format!("Error: {e}")
+                                }
+                                Err(_) => "Internal error".to_string(),
+                            };
+
+                            let (image_paths, remaining_text) =
+                                extract_image_paths(&response).await;
+
+                            for path in &image_paths {
+                                if let Err(e) = bot
+                                    .send_photo(chat_id, InputFile::file(path))
+                                    .await
+                                {
+                                    error!("Failed to send photo {}: {e}", path.display());
+                                }
+                            }
+
+                            let text_to_send = remaining_text.trim();
+                            if !text_to_send.is_empty() {
+                                if let Some(mid) = telegram_msg_id {
+                                    let html = markdown_to_telegram_html(text_to_send);
+                                    let chunks = split_message(&html);
+
+                                    let edit_result = bot
+                                        .edit_message_text(chat_id, mid, chunks[0])
+                                        .parse_mode(ParseMode::Html)
+                                        .await;
+                                    if let Err(e) = edit_result {
+                                        warn!("HTML edit failed, falling back to plain text: {e}");
+                                        let _ = bot
+                                            .edit_message_text(chat_id, mid, chunks[0])
+                                            .await;
+                                    }
+
+                                    for chunk in &chunks[1..] {
+                                        let result = bot
+                                            .send_message(chat_id, *chunk)
+                                            .parse_mode(ParseMode::Html)
+                                            .await;
+                                        if let Err(e) = result {
+                                            warn!("HTML send failed, falling back to plain text: {e}");
+                                            if let Err(e2) =
+                                                bot.send_message(chat_id, *chunk).await
+                                            {
+                                                error!("Failed to send Telegram message to {chat_id}: {e2}");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    send_html(&bot, chat_id, text_to_send).await;
+                                }
+                            } else if let Some(mid) = telegram_msg_id {
+                                let _ = bot.delete_message(chat_id, mid).await;
+                            }
+
+                            break;
+                        }
                     }
-                };
-
-                let (image_paths, remaining_text) = extract_image_paths(&response).await;
-
-                for path in &image_paths {
-                    if let Err(e) = bot
-                        .send_photo(chat_id, InputFile::file(path))
-                        .await
-                    {
-                        error!("Failed to send photo {}: {e}", path.display());
-                    }
-                }
-
-                let text_to_send = remaining_text.trim();
-                if !text_to_send.is_empty() {
-                    send_html(&bot, chat_id, text_to_send).await;
                 }
 
                 Ok(())
